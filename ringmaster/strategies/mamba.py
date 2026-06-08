@@ -65,6 +65,39 @@ def ring_shift_ssm_state(h_final: torch.Tensor) -> torch.Tensor:
     return h_prev
 
 
+def cp_state_prefix(ssm_state, chunk_decay, group, *, single_hop=False):
+    """State entering this rank's chunk: all-gather each rank's chunk decay ``A_r``
+    ([b, nheads]) and local final ``B_r`` (=``ssm_state``, h0=0), then LOCALLY prefix-
+    combine the predecessors — ``H_in_r = sum_{j<r} (prod_{j<k<r} A_k) B_j``. One
+    autograd-aware all-gather (decay+state packed together) + an O(P) local loop; no
+    serial P2P. Exact for any P. ``single_hop=True`` keeps only the immediate
+    predecessor (packed sequences, where cross-doc resets make the prefix doc-dependent).
+
+    Returns ``(h_prev, zero_keep)``; add ``zero_keep`` (None except on rank 0) to the
+    output so the gather stays in rank 0's graph and its backward all-reduce fires."""
+    from ringmaster.cp_collectives import all_gather_cp
+
+    rank = dist.get_rank(group)
+    b, nh = ssm_state.shape[0], chunk_decay.shape[1]
+    packed = torch.cat(
+        [chunk_decay.reshape(b, -1).to(ssm_state.dtype), ssm_state.reshape(b, -1)], dim=1
+    )
+    gathered = all_gather_cp(packed, group)  # [world, b, nheads + state]
+    zero_keep = 0.0 * gathered.float().sum() if rank == 0 else None
+
+    def _final(j):
+        return gathered[j][:, nh:].reshape_as(ssm_state)
+
+    if rank == 0:
+        return torch.zeros_like(ssm_state), zero_keep
+    if single_hop:
+        return _final(rank - 1), zero_keep
+    h_prev = torch.zeros_like(ssm_state)
+    for j in range(rank):
+        h_prev = gathered[j][:, :nh][..., None, None] * h_prev + _final(j)
+    return h_prev, zero_keep
+
+
 def mamba2_cp_correction(
     out: torch.Tensor,
     h_final: torch.Tensor,
@@ -231,19 +264,7 @@ def wrap_mamba_scan_for_cp(target_module) -> bool:
         if ssm_state is None:
             return result
 
-        # Autograd-aware state pass: all-gather the per-rank final states so the
-        # cross-rank state gradient flows (the plain P2P ring_shift is forward-only).
-        from ringmaster.cp_collectives import all_gather_cp
-
         group = _cp_group()
-        rank = dist.get_rank(group)
-        finals = all_gather_cp(ssm_state, group)  # [world, ...]
-        zero_keep = None
-        if rank > 0:
-            h_prev = finals[rank - 1]
-        else:
-            h_prev = torch.zeros_like(ssm_state)
-            zero_keep = 0.0 * finals.float().sum()  # keep gather in rank-0's graph
 
         dt_arg = kwargs.get("dt", args[1] if len(args) > 1 else None)
         A_arg = kwargs.get("A", args[2] if len(args) > 2 else None)
@@ -253,26 +274,27 @@ def wrap_mamba_scan_for_cp(target_module) -> bool:
         dt_bias = kwargs.get("dt_bias")
         dt_softplus = kwargs.get("dt_softplus", False)
         seq_idx = kwargs.get("seq_idx")
+        dt_eff = (
+            torch.nn.functional.softplus(dt_arg + (dt_bias if dt_bias is not None else 0))
+            if dt_softplus else dt_arg
+        )
+        cum_A = torch.cumsum(A_arg[None, None, :] * dt_eff, dim=1)  # [b, T, nheads]
 
-        if dt_softplus:
-            dt_eff = torch.nn.functional.softplus(
-                dt_arg + (dt_bias if dt_bias is not None else 0)
-            )
-        else:
-            dt_eff = dt_arg
-
-        dA = A_arg[None, None, :] * dt_eff
-        cum_A = torch.cumsum(dA, dim=1)
+        # exact cross-rank entering state (single-hop for packed; see cp_state_prefix)
+        nh = A_arg.shape[0]
+        chunk_decay = torch.exp(cum_A[:, -1])  # A_r per head: [b, nheads]
+        h_prev, zero_keep = cp_state_prefix(
+            ssm_state, chunk_decay, group, single_hop=seq_idx is not None
+        )
 
         x = args[0]
-        num_heads = A_arg.shape[0]
-        head_dim = x.shape[3] if x.ndim == 4 else x.shape[2] // num_heads
+        head_dim = x.shape[3] if x.ndim == 4 else x.shape[2] // nh
         B_dim, T_dim = x.shape[0], x.shape[1]
 
         scan_flat = scan_output.view(B_dim, T_dim, -1)
         scan_flat, ssm_state = mamba2_cp_correction(
             scan_flat, ssm_state, C_arg, cum_A, h_prev,
-            num_heads=num_heads, head_dim=head_dim, seq_idx=seq_idx,
+            num_heads=nh, head_dim=head_dim, seq_idx=seq_idx,
         )
         if zero_keep is not None:
             scan_flat = scan_flat + zero_keep.to(scan_flat.dtype)

@@ -62,11 +62,13 @@ class CPRuntime:
     @property
     def shard_load_balance(self) -> str:
         """Canonical shard layout for ``shard_batch`` (single source of truth shared
-        with the ring attention). Only ring + head_tail is zigzag; Ulysses, distflash
-        and none all shard contiguously."""
+        with the ring attention). Only PURE ring + head_tail is zigzag; Ulysses and USP
+        gather the full sequence per head (so must stay contiguous), and distflash/none
+        keep tokens contiguous too."""
         from ringmaster.config import LoadBalance
 
-        if self.ring_size > 1 and self.config.load_balance == LoadBalance.HEAD_TAIL:
+        if (self.ulysses_size == 1 and self.ring_size > 1
+                and self.config.load_balance == LoadBalance.HEAD_TAIL):
             return "head_tail"
         return "contiguous"
 
