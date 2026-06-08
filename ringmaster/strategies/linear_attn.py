@@ -169,6 +169,18 @@ def _torch_fallback_cp(mixer, conv_kernel_size):
             group = _cp_group()
             world = dist.get_world_size(group)
             rank = dist.get_rank(group)
+            if world > 2:
+                # Single-hop state pass: rank r consumes rank r-1's LOCAL final, exact
+                # only for cp_size<=2. The gated-delta per-step transition is a MATRIX
+                # (alpha_t (I - beta_t k_t k_t^T)), so it can't be scalar prefix-combined
+                # like an SSM; the exact cross-chunk pass needs the chunk transition
+                # matrices, which fla's native cp_context handles. Fail loud, don't
+                # silently mis-train.
+                raise NotImplementedError(
+                    "torch-fallback gated-delta CP is exact only for cp_size<=2; for "
+                    "cp_size>2 use fla's native cp_context (ensure fla>=0.5.1 and do not "
+                    "set RINGMASTER_NO_FLA_SHIM)."
+                )
             kw_local = {**kw, "initial_state": None, "output_final_state": True}
             out, fin = torch_gdn(*args, **kw_local)
             finals = _AllGather.apply(fin, group)  # [world, ...], autograd-aware
