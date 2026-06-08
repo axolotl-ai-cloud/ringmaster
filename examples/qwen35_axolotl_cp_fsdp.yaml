@@ -1,0 +1,44 @@
+# Axolotl + ringmaster context-parallel e2e smoke on a real Qwen3.5 (gated-delta
+# linear attention). FSDP2 is required: the ContextParallelPlugin builds `cp` as a
+# non-DP mesh dim and FSDP2 reduces gradients over it (plain DDP cannot all-reduce
+# across CP ranks). Exercises the sm_120 TileLang warp-spec shim via the native
+# fla gated-delta backward.
+#   axolotl train qwen35_axolotl_cp_fsdp.yaml      # auto-launches on 2 GPUs
+base_model: Qwen/Qwen3.5-4B
+trust_remote_code: false
+plugins:
+  - axolotl.integrations.context_parallel.ContextParallelPlugin
+flash_attention: true
+context_parallel:
+  size: 2
+  backend: ring
+  ring_impl: hf_kernels
+dp_shard_size: 1
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  state_dict_type: SHARDED_STATE_DICT
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: Qwen3_5DecoderLayer
+  reshard_after_forward: true
+datasets:
+  - path: synthetic
+    type: _synthetic
+    length: 16
+    sequence_length: 1024
+    min_input_id: 100
+    max_input_id: 100000
+    seed: 42
+val_set_size: 0.0
+sequence_len: 1024
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+max_steps: 3
+output_dir: /tmp/qwen35-cpfsdp-out
+learning_rate: 1.0e-5
+optimizer: adamw_torch
+lr_scheduler: constant
+bf16: true
+gradient_checkpointing: false
+logging_steps: 1
+save_strategy: "no"

@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Test / lint / type caches
+.pytest_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# Training / example artifacts
+outputs/
+last_run_prepared/
+wandb/
+*.log
+checkpoint-*/
+runs/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp

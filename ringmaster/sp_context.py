@@ -1,0 +1,147 @@
+"""Framework-agnostic CP data orchestration shared by the axolotl plugin, trl
+trainer and raw scripts: broadcast the batch so all ranks shard the same sample,
+shard the sequence dim, normalize num_items / correct eval loss, optionally gather
+outputs. Attention is the backend's job (ring/ulysses + linear-attn/mamba wraps).
+"""
+
+from __future__ import annotations
+
+import inspect
+
+import torch
+import torch.distributed as dist
+
+from ringmaster.cp_collectives import seq_gather_cp
+from ringmaster.loss import correct_eval_loss, global_num_items_in_batch
+from ringmaster.shard import shard_batch
+
+
+def broadcast_batch(kwargs: dict, group, src: int | None = None) -> None:
+    """Broadcast every sequence tensor in ``kwargs`` from ``src`` across ``group``.
+
+    Shape-safe: agree on the source shape first, else an in-place broadcast writes
+    the payload into a smaller local buffer (variable-length samples) → OOB.
+    """
+    if group is None or dist.get_world_size(group) == 1:
+        return
+    if src is None:
+        src = dist.get_process_group_ranks(group)[0]
+    is_src = dist.get_rank(group) == src
+    for key, val in list(kwargs.items()):
+        if not isinstance(val, torch.Tensor) or val.dim() < 1:
+            continue
+        ndim = torch.tensor([val.dim()], device=val.device)
+        dist.broadcast(ndim, src=src, group=group)
+        if is_src:
+            shape = torch.tensor(val.shape, dtype=torch.long, device=val.device)
+        else:
+            shape = torch.empty(int(ndim.item()), dtype=torch.long, device=val.device)
+        dist.broadcast(shape, src=src, group=group)
+        shape = torch.Size(shape.tolist())
+        t = val.contiguous() if val.shape == shape else torch.empty(
+            shape, dtype=val.dtype, device=val.device
+        )
+        dist.broadcast(t, src=src, group=group)
+        kwargs[key] = t
+
+
+class ContextParallelContextManager:
+    """Install CP data hooks on ``models``. Use as a context manager or via
+    :meth:`install` / :meth:`remove` for a persistent (plugin-style) lifecycle."""
+
+    def __init__(
+        self,
+        models,
+        cp_group,
+        *,
+        gradient_accumulation_steps: int = 1,
+        gather_outputs: bool = False,
+        load_balance: str = "contiguous",
+    ):
+        self.models = list(models)
+        self.cp_group = cp_group
+        self.grad_accum = int(gradient_accumulation_steps or 1)
+        self.gather_outputs = gather_outputs
+        self.load_balance = load_balance
+        self.cp_size = dist.get_world_size(cp_group) if cp_group is not None else 1
+        self.cp_rank = dist.get_rank(cp_group) if cp_group is not None else 0
+        self._handles: list = []
+        self._local_valid = None
+        self._pad_len = 0
+        self._orig_seq_len = 0
+
+    def __enter__(self):
+        self.install()
+        return self
+
+    def __exit__(self, *exc):
+        self.remove()
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+
+    def install(self):
+        for model in self.models:
+            forward_params = list(inspect.signature(model.forward).parameters.keys())
+            self._handles.append(
+                model.register_forward_pre_hook(
+                    self._make_pre_hook(forward_params), with_kwargs=True
+                )
+            )
+            self._handles.append(model.register_forward_hook(self._post_hook))
+        return self._handles
+
+    def _make_pre_hook(self, forward_params):
+        def pre_hook(module, args, kwargs):
+            kwargs = dict(kwargs)
+            for i, arg in enumerate(args):
+                if i < len(forward_params):
+                    kwargs[forward_params[i]] = arg
+            remaining = args[len(forward_params):]
+
+            ids = kwargs.get("input_ids")
+            if ids is None or self.cp_size == 1:
+                return remaining, kwargs
+
+            broadcast_batch(kwargs, self.cp_group)
+            kwargs, info = shard_batch(
+                kwargs, cp_rank=self.cp_rank, cp_size=self.cp_size,
+                load_balance=self.load_balance,
+            )
+            self._orig_seq_len, self._pad_len = info.original_seq_len, info.pad_len
+
+            # count valid tokens from shift_labels (what the model's loss uses)
+            count_labels = kwargs.get("shift_labels")
+            if count_labels is None:
+                count_labels = kwargs.get("labels")
+            if count_labels is not None:
+                if module.training and kwargs.get("num_items_in_batch") is not None:
+                    kwargs["num_items_in_batch"] = global_num_items_in_batch(
+                        count_labels, self.cp_group, self.grad_accum
+                    )
+                if not module.training:
+                    self._local_valid = (count_labels != -100).sum().float()
+                    kwargs.pop("num_items_in_batch", None)
+            return remaining, kwargs
+
+        return pre_hook
+
+    def _post_hook(self, module, inputs, output):
+        if self.cp_size > 1 and self.gather_outputs:
+            # Reassemble the sequence-sharded outputs (assumes contiguous layout —
+            # GRPO/EBFT use it; zigzag would need the inverse permutation).
+            local_len = (self._orig_seq_len + self._pad_len) // self.cp_size
+            for key, val in list(output.items()):
+                if isinstance(val, torch.Tensor) and val.dim() > 1 and val.size(1) == local_len:
+                    gathered = seq_gather_cp(val, self.cp_group)
+                    if self._pad_len:
+                        gathered = gathered[:, : self._orig_seq_len].contiguous()
+                    output[key] = gathered
+        if self._local_valid is not None and getattr(output, "loss", None) is not None:
+            output["loss"] = correct_eval_loss(
+                output.loss, self._local_valid, self.cp_group
+            )
+        self._local_valid = None
+        return output

@@ -1,0 +1,66 @@
+# Llama-3.1-8B — long-context SFT with ringmaster context parallelism + FSDP2.
+#
+# CP splits each sample's sequence across the `cp` ranks (ring attention computes
+# full-sequence attention across them); FSDP2 shards the parameters over the same
+# ranks and its gradient reduction sums the CP-partial grads. FSDP2 is REQUIRED:
+# the plugin builds `cp` as a non-DP mesh dim, and plain DDP cannot all-reduce
+# gradients across CP ranks.
+#
+#   axolotl train llama3-8b-cp-fsdp2.yaml        # auto-launches across visible GPUs
+#
+# GPU math: world = dp_shard_size * context_parallel.size. With 8 GPUs and
+# context_parallel.size: 2 you get dp_shard_size: 4 (4-way FSDP x 2-way CP). Set
+# dp_shard_size to taste; 1 = pure CP (no data parallelism).
+
+base_model: NousResearch/Meta-Llama-3.1-8B   # ungated mirror of meta-llama/Llama-3.1-8B
+
+plugins:
+  - axolotl.integrations.context_parallel.ContextParallelPlugin
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin   # fused logits+loss; big win at long ctx
+
+flash_attention: true            # the kernel ringmaster's ring leg wraps (FA2)
+
+context_parallel:
+  size: 8                        # total context-parallel degree
+  backend: ring                  # ring attention (memory-frugal, scales the sequence)
+  ring_impl: hf_kernels          # FA2/3/4 flash per ring block (no flash_attn pypi)
+  load_balance: head_tail        # zigzag balances the causal triangle (attention-only model)
+  rotate_method: allgather
+
+# FSDP2 — shards params over the world; grads reduce over the cp dim.
+dp_shard_size: 1                 # bump to N for N-way data-parallel x CP (needs N*size GPUs)
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  state_dict_type: SHARDED_STATE_DICT
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: LlamaDecoderLayer
+  reshard_after_forward: true
+
+sequence_len: 32768              # long context — split across the CP ranks
+sample_packing: false           # packing/varlen is CP v2; one long sequence per step for now
+pad_to_sequence_len: true
+
+datasets:
+  - path: tatsu-lab/alpaca
+    type: alpaca
+val_set_size: 0.0
+output_dir: ./outputs/llama3-8b-cp-fsdp2
+dataset_prepared_path: last_run_prepared
+
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+num_epochs: 1
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 1.0e-5
+warmup_ratio: 0.1
+weight_decay: 0.0
+
+bf16: true
+tf32: true
+gradient_checkpointing: true
+logging_steps: 1
+saves_per_epoch: 1
+special_tokens:
+  pad_token: <|end_of_text|>

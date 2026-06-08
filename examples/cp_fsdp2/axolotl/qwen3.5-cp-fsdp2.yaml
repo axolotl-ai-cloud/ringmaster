@@ -1,0 +1,73 @@
+# Qwen3.5-4B — long-context SFT with ringmaster context parallelism + FSDP2.
+#
+# Qwen3.5 is a HYBRID: gated-delta linear-attention layers + full-attention layers.
+# The plugin auto-wires the linear-attention mixers for CP state-passing (each rank
+# scans its chunk; a correction stitches the global recurrence). Because the linear
+# recurrence needs CONTIGUOUS token order, the plugin auto-downgrades zigzag
+# (head_tail) to contiguous sharding for hybrids — so leave load_balance default.
+#
+# FlaSm120ShimPlugin: on cu13 + sm_120 (Blackwell) fla's gated-delta backward hits a
+# TileLang misaligned-address; the shim routes around just that pass (numerics
+# unchanged). Harmless elsewhere.
+#
+#   axolotl train qwen3.5-cp-fsdp2.yaml
+
+base_model: Qwen/Qwen3.5-4B
+trust_remote_code: false         # built-in modeling supports FA2
+
+plugins:
+  - axolotl.integrations.context_parallel.ContextParallelPlugin
+  - axolotl.integrations.fla_sm120_shim.FlaSm120ShimPlugin           # Blackwell gated-delta shim
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
+
+flash_attention: true
+
+context_parallel:
+  size: 8
+  backend: ring
+  ring_impl: hf_kernels
+  # load_balance: default (none/contiguous) — hybrid recurrence is not zigzag-safe;
+  # the plugin forces contiguous for hybrids anyway.
+
+dp_shard_size: 1                 # world = dp_shard_size * context_parallel.size
+fsdp_version: 2
+fsdp_config:
+  offload_params: false
+  state_dict_type: SHARDED_STATE_DICT
+  auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  transformer_layer_cls_to_wrap: Qwen3_5DecoderLayer
+  reshard_after_forward: true
+
+chat_template: qwen3_5
+datasets:
+  - path: mlabonne/FineTome-100k
+    type: chat_template
+    split: train[:20%]
+    field_messages: conversations
+    message_property_mappings:
+      role: from
+      content: value
+val_set_size: 0.0
+output_dir: ./outputs/qwen3.5-4b-cp-fsdp2
+dataset_prepared_path: last_run_prepared
+
+sequence_len: 32768
+sample_packing: false
+pad_to_sequence_len: true
+
+micro_batch_size: 1
+gradient_accumulation_steps: 1
+num_epochs: 1
+optimizer: adamw_torch
+lr_scheduler: cosine
+learning_rate: 1.0e-5
+warmup_ratio: 0.1
+weight_decay: 0.0
+
+bf16: true
+tf32: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+logging_steps: 1
+saves_per_epoch: 1
