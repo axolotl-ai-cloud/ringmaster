@@ -31,6 +31,11 @@ import torch.distributed as dist
 from ringmaster.ring.kernels import hf_kernels_block, math_block
 from ringmaster.ring.merge import update_out_and_lse
 from ringmaster.ring.p2p_attn import _flash_ops, _shift_sync
+from ringmaster.ring.varlen_blocks import (
+    doc_ids_from_cu,
+    varlen_block_bwd,
+    varlen_block_fwd,
+)
 
 
 def _block_fwd(q, k, v, scale, causal, flash):
@@ -81,7 +86,8 @@ def _block_bwd(d_out, q, k, v, out, lse, scale, causal, flash, dq=None, dk=None,
 
 class DistFlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, group, scaling):
+    def forward(ctx, q, k, v, group, scaling, cu_seqlens=None,
+                attn_impl="flash_attention_2"):
         P = dist.get_world_size(group)
         r = dist.get_rank(group)
         half = P // 2
@@ -95,7 +101,21 @@ class DistFlashAttention(torch.autograd.Function):
         kd = k.transpose(1, 2).contiguous()
         vd = v.transpose(1, 2).contiguous()
 
-        o, l = _block_fwd(qd, kd, vd, scale, True, flash)  # d=0 diagonal
+        # packed: each block is doc-masked by its owners' global offsets (oq, ok)
+        ctx.varlen = cu_seqlens is not None
+        if ctx.varlen:
+            doc = doc_ids_from_cu(cu_seqlens, q.device)
+            Lr = qd.shape[1]
+            ctx.doc, ctx.Lr, ctx.attn_impl = doc, Lr, attn_impl
+
+            def bf(qb, kb, vb, oq, ok, diag):
+                return varlen_block_fwd(qb, kb, vb, oq * Lr, ok * Lr, Lr, doc, scale,
+                                        diag, attn_impl, flash)
+        else:
+            def bf(qb, kb, vb, oq, ok, diag):
+                return _block_fwd(qb, kb, vb, scale, diag, flash)
+
+        o, l = bf(qd, kd, vd, r, r, True)  # d=0 diagonal
         out, lse = update_out_and_lse(None, None, o, l)
 
         cur_k, cur_v = kd, vd  # phase 2: rotate KV, owner-local
@@ -103,7 +123,7 @@ class DistFlashAttention(torch.autograd.Function):
             cur_k = _shift_sync(cur_k, group, up, down)  # -> kv_{r-d}
             cur_v = _shift_sync(cur_v, group, up, down)
             if d > half and r - d >= 0:
-                o, l = _block_fwd(qd, cur_k, cur_v, scale, False, flash)
+                o, l = bf(qd, cur_k, cur_v, r, r - d, False)
                 out, lse = update_out_and_lse(out, lse, o, l)
 
         cur_q = qd  # phase 1: rotate Q, helper computes q_{r+d} x kv_r, route partial back
@@ -111,7 +131,7 @@ class DistFlashAttention(torch.autograd.Function):
             cur_q = _shift_sync(cur_q, group, down, up)  # -> q_{r+d}
             send_po = send_pl = None
             if r + d < P:
-                send_po, send_pl = _block_fwd(cur_q, kd, vd, scale, False, flash)
+                send_po, send_pl = bf(cur_q, kd, vd, r + d, r, False)
             recv = _route(send_po, send_pl, group, ranks, r, d, P,
                           like_o=qd, like_l=(qd.shape[0], qd.shape[2], qd.shape[1]))
             if r - d >= 0:
@@ -130,10 +150,25 @@ class DistFlashAttention(torch.autograd.Function):
         ranks = dist.get_process_group_ranks(group)
         up, down = ranks[(r + 1) % P], ranks[(r - 1) % P]
         dod = d_out.contiguous()
+        if ctx.varlen:
+            doc, Lr, attn_impl = ctx.doc, ctx.Lr, ctx.attn_impl
+
+            def bb(dob, qb, kb, vb, ob, lb, oq, ok, diag):
+                return varlen_block_bwd(dob, qb, kb, vb, ob, lb, oq * Lr, ok * Lr, Lr,
+                                        doc, scale, diag, attn_impl, flash)
+        else:
+            # one scratch set reused across the non-diagonal block grads (no per-hop
+            # alloc); the diagonal seeds the accumulators so it gets fresh buffers.
+            bdq, bdk, bdv = torch.empty_like(qd), torch.empty_like(kd), torch.empty_like(vd)
+
+            def bb(dob, qb, kb, vb, ob, lb, oq, ok, diag):
+                if diag:
+                    return _block_bwd(dob, qb, kb, vb, ob, lb, scale, True, flash)
+                return _block_bwd(dob, qb, kb, vb, ob, lb, scale, False, flash,
+                                  dq=bdq, dk=bdk, dv=bdv)
+
         # d=0 diagonal (local) — seeds the dq/dk/dv accumulators (kept, mutated in place)
-        dq, dk, dv = _block_bwd(dod, qd, kd, vd, out, lse, scale, True, flash)
-        # one scratch set reused for every non-diagonal block grad (no per-hop alloc)
-        bdq, bdk, bdv = torch.empty_like(qd), torch.empty_like(kd), torch.empty_like(vd)
+        dq, dk, dv = bb(dod, qd, kd, vd, out, lse, r, r, True)
 
         # phase 2: mirror KV rotation; dk/dv for kv_{r-d} accumulate into a rotating
         # buffer that returns to the kv owner after P-1 hops (like the p2p ring bwd).
@@ -144,9 +179,7 @@ class DistFlashAttention(torch.autograd.Function):
             cur_k = _shift_sync(cur_k, group, up, down)
             cur_v = _shift_sync(cur_v, group, up, down)
             if d > half and r - d >= 0:
-                # flash writes into bdq/bdk/bdv and returns them; explicit returns fresh
-                dq_b, dk_b, dv_b = _block_bwd(dod, qd, cur_k, cur_v, out, lse, scale,
-                                              False, flash, dq=bdq, dk=bdk, dv=bdv)
+                dq_b, dk_b, dv_b = bb(dod, qd, cur_k, cur_v, out, lse, r, r - d, False)
                 dq.add_(dq_b)
                 cur_dk.add_(dk_b)
                 cur_dv.add_(dv_b)
@@ -181,8 +214,7 @@ class DistFlashAttention(torch.autograd.Function):
             dq_back = qd  # placeholder shape; real only when we are a valid helper
             if is_helper:
                 rdod, rq, rout, rlse = rc
-                dq_h, dk_h, dv_h = _block_bwd(rdod, rq, kd, vd, rout, rlse, scale,
-                                              False, flash, dq=bdq, dk=bdk, dv=bdv)
+                dq_h, dk_h, dv_h = bb(rdod, rq, kd, vd, rout, rlse, r + d, r, False)
                 dk.add_(dk_h)
                 dv.add_(dv_h)
                 dq_back = dq_h  # owner's dq contribution (scratch on flash; sent before reuse)
@@ -191,7 +223,8 @@ class DistFlashAttention(torch.autograd.Function):
             if is_owner:
                 dq.add_(gc[0])
 
-        return (dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2), None, None)
+        return (dq.transpose(1, 2), dk.transpose(1, 2), dv.transpose(1, 2),
+                None, None, None, None)
 
 
 def _route(po, pl, group, ranks, r, d, P, like_o, like_l):
@@ -251,6 +284,8 @@ def _bwd_route(send, send_valid, send_to, recv_from, recv_valid, group, sym, rec
     return recv
 
 
-def distflash_attention(q, k, v, *, group, scaling):
-    """Balanced contiguous causal ring (DistFlashAttn-style). q/k/v: [b,H,s_local,d]."""
-    return DistFlashAttention.apply(q, k, v, group, scaling)
+def distflash_attention(q, k, v, *, group, scaling, cu_seqlens=None,
+                        attn_implementation="flash_attention_2"):
+    """Balanced contiguous causal ring (DistFlashAttn-style). q/k/v: [b,H,s_local,d].
+    ``cu_seqlens`` set => packed (doc-masked) blocks."""
+    return DistFlashAttention.apply(q, k, v, group, scaling, cu_seqlens, attn_implementation)

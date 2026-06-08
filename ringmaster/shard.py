@@ -22,6 +22,44 @@ def _pad_multiple(seq_len: int, cp_size: int) -> int:
     return 0 if rem == 0 else cp_size - rem
 
 
+def cu_seqlens_from_position_ids(position_ids):
+    """Global flash ``cu_seqlens`` + max_seqlen from packed ``position_ids`` (which reset
+    to 0 at each document start). Returns None when not packed (<= one segment per row,
+    i.e. plain dense/batched attention). Mirrors transformers'
+    ``prepare_fa_kwargs_from_position_ids``."""
+    pos = position_ids.reshape(-1)
+    starts = (pos == 0).nonzero(as_tuple=False).view(-1)
+    if starts.numel() <= position_ids.shape[0]:
+        return None
+    cu = torch.cat([
+        starts.to(torch.int32),
+        torch.tensor([pos.numel()], dtype=torch.int32, device=pos.device),
+    ])
+    return cu, int(cu.diff().max().item())
+
+
+def varlen_meta(global_position_ids, total_padded_len):
+    """(cu_seqlens, max_seqlen) over the full padded sequence, or None if not packed.
+
+    ``global_position_ids`` is the pre-shard packed positions; ``total_padded_len`` is
+    the post-pad sequence length the Ulysses all-to-all will reassemble. Any CP pad
+    tokens become a trailing segment so ``cu_seqlens[-1]`` matches the gathered length.
+    Batch size 1 only (the standard packed-sequence setup)."""
+    if global_position_ids is None or global_position_ids.shape[0] != 1:
+        return None
+    res = cu_seqlens_from_position_ids(global_position_ids)
+    if res is None:
+        return None
+    cu, max_len = res
+    orig = int(cu[-1].item())
+    if total_padded_len > orig:
+        cu = torch.cat(
+            [cu, torch.tensor([total_padded_len], dtype=torch.int32, device=cu.device)]
+        )
+        max_len = max(max_len, total_padded_len - orig)
+    return cu, max_len
+
+
 def _ensure_global_shift_labels(batch):
     """Shift once on the full sequence before sharding: per-shard the boundary target
     (first token of the next rank's shard) is unreachable and would train vs -100."""

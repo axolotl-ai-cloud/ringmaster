@@ -56,10 +56,30 @@ def make_ring_attention(provider: str, attn_implementation: str, rotate_method: 
 
         from ringmaster.config import LoadBalance
 
-        balanced = (
-            causal and window is None and group is not None
-            and dist.get_world_size(group) > 1
-        )
+        multi = group is not None and dist.get_world_size(group) > 1
+        # Packed sequences: distflash keeps its balanced schedule with doc-masked
+        # blocks; plain ring (and zigzag, for now) use the contiguous doc-masked path.
+        if rt.varlen is not None and multi:
+            cu = rt.varlen[0]
+            if rt.config.load_balance == LoadBalance.DISTFLASH:
+                from ringmaster.ring.distflash import distflash_attention
+
+                return distflash_attention(
+                    query, key, value, group=group, scaling=scaling, cu_seqlens=cu,
+                    attn_implementation=attn_implementation,
+                ), None
+            if rt.config.load_balance == LoadBalance.HEAD_TAIL:
+                from ringmaster.ring.zigzag import zigzag_ring_attention
+
+                return zigzag_ring_attention(
+                    query, key, value, group=group, scaling=scaling, cu_seqlens=cu
+                ), None
+            from ringmaster.ring.loop import varlen_ring_attention
+
+            return varlen_ring_attention(
+                query, key, value, group=group, scaling=scaling, cu_seqlens=cu
+            ), None
+        balanced = causal and window is None and multi
         # Zigzag (head_tail): inputs are zigzag-sharded (rank holds chunks [r, 2W-1-r]);
         # balanced half-work ring. NOT SSM-safe (permutes tokens).
         if balanced and rt.config.load_balance == LoadBalance.HEAD_TAIL:

@@ -90,6 +90,43 @@ class _AllGatherKV(torch.autograd.Function):
         return grad_in, None
 
 
+from ringmaster.ring.varlen_blocks import doc_ids_from_cu as _doc_ids
+
+
+def varlen_ring_attention(q, k, v, *, group, scaling, cu_seqlens):
+    """Packed-sequence ring attention on a contiguous shard. Gathers full K/V (the
+    ring's autograd-aware allgather) and runs ONE document-masked SDPA of this rank's
+    Q-slice against the whole sequence — correct for any ring-family backend, autograd
+    handles the backward. Zigzag/distflash load-balancing doesn't apply to packed
+    sequences (v1), so they route here too. q/k/v: [b, H, s_local, d] (b=1)."""
+    import math
+
+    import torch.nn.functional as F
+
+    rank = dist.get_rank(group)
+    qb = q.transpose(1, 2).contiguous()  # [b, L, Hq, d]
+    kb = k.transpose(1, 2).contiguous()
+    vb = v.transpose(1, 2).contiguous()
+    k_full = torch.cat(list(_AllGatherKV.apply(kb, group).unbind(0)), dim=1)  # [b, S, Hkv, d]
+    v_full = torch.cat(list(_AllGatherKV.apply(vb, group).unbind(0)), dim=1)
+
+    L, S = qb.shape[1], k_full.shape[1]
+    dev = qb.device
+    doc = _doc_ids(cu_seqlens, dev)[:S]
+    qidx = torch.arange(rank * L, rank * L + L, device=dev)
+    kidx = torch.arange(S, device=dev)
+    # attend within the same document, causally in global order
+    allow = (doc[qidx].unsqueeze(1) == doc.unsqueeze(0)) & (kidx.unsqueeze(0) <= qidx.unsqueeze(1))
+
+    scale = scaling if scaling is not None else 1.0 / math.sqrt(qb.shape[-1])
+    out = F.scaled_dot_product_attention(
+        qb.transpose(1, 2), k_full.transpose(1, 2), v_full.transpose(1, 2),
+        attn_mask=allow.unsqueeze(0).unsqueeze(0), scale=scale,
+        enable_gqa=qb.shape[2] != kb.shape[2],
+    )  # [b, Hq, L, d]
+    return out.transpose(1, 2)  # [b, L, Hq, d]
+
+
 def _allgather_ring(q, k, v, group, causal, scaling, dropout, block, attn_impl, window):
     rank = dist.get_rank(group)
     world = dist.get_world_size(group)

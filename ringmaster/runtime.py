@@ -30,6 +30,10 @@ class CPRuntime:
     # attn_implementation the host should set on the model (e.g. the registered
     # Ulysses name, or sdpa/flex for the Ring leg).
     attn_implementation: Optional[str] = None
+    # Packed-sequence (varlen) metadata for the CURRENT step: (cu_seqlens int32
+    # [n_seg+1] over the FULL global sequence, max_seqlen int), or None for dense.
+    # Set per-step by the CP context manager; read by the Ulysses varlen path.
+    varlen: Optional[tuple] = None
 
     @property
     def ulysses_size(self) -> int:

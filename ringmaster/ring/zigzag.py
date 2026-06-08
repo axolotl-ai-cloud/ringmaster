@@ -29,6 +29,21 @@ import torch.distributed as dist
 
 from ringmaster.ring.merge import _lse_to_bshd
 from ringmaster.ring.p2p_attn import _flash_ops, _peers, _prefetch, _shift_sync
+from ringmaster.ring.varlen_blocks import (
+    additive_doc_mask,
+    doc_ids_from_cu,
+    masked_block_bwd,
+    masked_block_fwd,
+)
+
+
+def _zigzag_gidx(rank, half, world, device):
+    """Global token indices of rank's two zigzag chunks [rank, 2W-1-rank], in local
+    order (early chunk then late chunk)."""
+    return torch.cat([
+        torch.arange(rank * half, (rank + 1) * half, device=device),
+        torch.arange((2 * world - 1 - rank) * half, (2 * world - rank) * half, device=device),
+    ])
 
 
 def _merge_full(out, lse, block_out, block_lse):
@@ -54,21 +69,60 @@ def _merge_slice(out, lse, block_out, block_lse, sl):
 
 class ZigzagRingAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, group, scaling):
+    def forward(ctx, q, k, v, group, scaling, cu_seqlens=None):
         world = dist.get_world_size(group)
         rank = dist.get_rank(group)
         send, recv = _peers(group)
         scale = scaling if scaling is not None else 1.0 / math.sqrt(q.shape[-1])
-        ops = _flash_ops()
-        if ops is None or not q.is_cuda:
-            raise RuntimeError("zigzag ring attention requires the CUDA flash kernel")
-        fwd, _ = ops
 
         qd = q.transpose(1, 2).contiguous()  # [b, L, H, d]
         cur_k = k.transpose(1, 2).contiguous()
         cur_v = v.transpose(1, 2).contiguous()
         half = qd.shape[1] // 2
         q1 = qd[:, half:].contiguous()
+        ctx.group, ctx.scale, ctx.half = group, scale, half
+        ctx.varlen = cu_seqlens is not None
+
+        if ctx.varlen:
+            # packed: doc-masked explicit blocks (flash varlen can't express zigzag's
+            # non-contiguous chunks). Global-index masks subsume the schedule's causality.
+            doc = doc_ids_from_cu(cu_seqlens, qd.device)
+            g = _zigzag_gidx(rank, half, world, qd.device)
+            out = lse = None
+            for s in range(world):
+                rem = (rank - s) % world
+                if s < world - 1:
+                    (nk, nv), works = _prefetch((cur_k, cur_v), group, send, recv)
+                if s == 0:
+                    m = additive_doc_mask(g, g, doc, True)
+                    bo, bl = masked_block_fwd(qd, cur_k, cur_v, m, scale)
+                    out, lse = _merge_full(out, lse, bo, bl)
+                elif s <= rank:
+                    kg = torch.arange(rem * half, (rem + 1) * half, device=qd.device)
+                    m = additive_doc_mask(g, kg, doc, True)
+                    bo, bl = masked_block_fwd(qd, cur_k[:, :half].contiguous(),
+                                              cur_v[:, :half].contiguous(), m, scale)
+                    out, lse = _merge_full(out, lse, bo, bl)
+                else:
+                    m = additive_doc_mask(g[half:], _zigzag_gidx(rem, half, world, qd.device),
+                                          doc, True)
+                    bo, bl = masked_block_fwd(q1, cur_k, cur_v, m, scale)
+                    out, lse = _merge_slice(out, lse, bo, bl, slice(half, None))
+                if s < world - 1:
+                    for w in works:
+                        w.wait()
+                    cur_k, cur_v = nk, nv
+            out_bshd = out.to(q.dtype)
+            ctx.save_for_backward(qd, k.transpose(1, 2).contiguous(),
+                                  v.transpose(1, 2).contiguous(), out_bshd,
+                                  lse.squeeze(-1).transpose(1, 2).contiguous())
+            ctx.doc = doc
+            return out_bshd
+
+        ops = _flash_ops()
+        if ops is None or not q.is_cuda:
+            raise RuntimeError("zigzag ring attention requires the CUDA flash kernel")
+        fwd, _ = ops
         out = lse = None
         for s in range(world):
             if s < world - 1:
@@ -92,7 +146,6 @@ class ZigzagRingAttention(torch.autograd.Function):
         lse_bhs = lse.squeeze(-1).transpose(1, 2).contiguous()  # [b, H, L]
         ctx.save_for_backward(qd, k.transpose(1, 2).contiguous(),
                               v.transpose(1, 2).contiguous(), out_bshd, lse_bhs)
-        ctx.group, ctx.scale, ctx.half = group, scale, half
         return out_bshd
 
     @staticmethod
@@ -102,7 +155,6 @@ class ZigzagRingAttention(torch.autograd.Function):
         world = dist.get_world_size(group)
         rank = dist.get_rank(group)
         send, recv = _peers(group)
-        _, bwd = _flash_ops()
 
         dod = d_out.contiguous()  # [b, L, H, d]
         q1 = qd[:, half:].contiguous()
@@ -114,6 +166,49 @@ class ZigzagRingAttention(torch.autograd.Function):
         cur_k, cur_v = k_local, v_local
         cur_dk = torch.zeros_like(k_local)
         cur_dv = torch.zeros_like(v_local)
+
+        if ctx.varlen:
+            doc = ctx.doc
+            g = _zigzag_gidx(rank, half, world, qd.device)
+            for s in range(world):
+                rem = (rank - s) % world
+                if s < world - 1:
+                    (nk, nv), kv_works = _prefetch((cur_k, cur_v), group, send, recv)
+                if s == 0:
+                    m = additive_doc_mask(g, g, doc, True)
+                    dqb, dkb, dvb = masked_block_bwd(dod, qd, cur_k, cur_v, out, lse, m, scale)
+                    dq += dqb
+                    cur_dk += dkb
+                    cur_dv += dvb
+                elif s <= rank:
+                    kg = torch.arange(rem * half, (rem + 1) * half, device=qd.device)
+                    m = additive_doc_mask(g, kg, doc, True)
+                    dqb, dk0, dv0 = masked_block_bwd(
+                        dod, qd, cur_k[:, :half].contiguous(), cur_v[:, :half].contiguous(),
+                        out, lse, m, scale)
+                    dq += dqb
+                    cur_dk[:, :half] += dk0
+                    cur_dv[:, :half] += dv0
+                else:
+                    m = additive_doc_mask(g[half:], _zigzag_gidx(rem, half, world, qd.device),
+                                          doc, True)
+                    dq1, dkb, dvb = masked_block_bwd(dod1, q1, cur_k, cur_v, out1, lse1, m, scale)
+                    dq[:, half:] += dq1
+                    cur_dk += dkb
+                    cur_dv += dvb
+                cur_dk = _shift_sync(cur_dk, group, send, recv)
+                cur_dv = _shift_sync(cur_dv, group, send, recv)
+                if s < world - 1:
+                    for w in kv_works:
+                        w.wait()
+                    cur_k, cur_v = nk, nv
+                else:
+                    cur_k = _shift_sync(cur_k, group, send, recv)
+                    cur_v = _shift_sync(cur_v, group, send, recv)
+            return (dq.transpose(1, 2), cur_dk.transpose(1, 2), cur_dv.transpose(1, 2),
+                    None, None, None)
+
+        _, bwd = _flash_ops()
         for s in range(world):
             if s < world - 1:
                 (nk, nv), kv_works = _prefetch((cur_k, cur_v), group, send, recv)
@@ -156,9 +251,10 @@ class ZigzagRingAttention(torch.autograd.Function):
                 cur_k = _shift_sync(cur_k, group, send, recv)
                 cur_v = _shift_sync(cur_v, group, send, recv)
         return (dq.transpose(1, 2), cur_dk.transpose(1, 2), cur_dv.transpose(1, 2),
-                None, None)
+                None, None, None)
 
 
-def zigzag_ring_attention(q, k, v, *, group, scaling):
-    """q/k/v: [b, H, local_len, d] (two zigzag chunks). Returns [b, local_len, H, d]."""
-    return ZigzagRingAttention.apply(q, k, v, group, scaling)
+def zigzag_ring_attention(q, k, v, *, group, scaling, cu_seqlens=None):
+    """q/k/v: [b, H, local_len, d] (two zigzag chunks). Returns [b, local_len, H, d].
+    ``cu_seqlens`` set => packed (doc-masked) blocks."""
+    return ZigzagRingAttention.apply(q, k, v, group, scaling, cu_seqlens)

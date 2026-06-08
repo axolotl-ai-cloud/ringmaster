@@ -118,19 +118,24 @@ def make_usp_attention(provider: str, attn_implementation: str, rotate_method):
         kv = seq_all_to_all(kv, scatter_dim=2, gather_dim=3, group=ug)
         k, v = kv[0], kv[1]
 
-        out = ring_attention(
-            q,
-            k,
-            v,
-            group=rg,
-            causal=causal,
-            scaling=scaling,
-            dropout=dropout,
-            provider=provider,
-            rotate_method=rotate_method,
-            attn_implementation=attn_implementation,
-            window=window,
-        )  # [b, S/R, H/U, d]
+        if rt.varlen is not None:
+            from ringmaster.ring.loop import varlen_ring_attention
+
+            out = varlen_ring_attention(q, k, v, group=rg, scaling=scaling, cu_seqlens=rt.varlen[0])
+        else:
+            out = ring_attention(
+                q,
+                k,
+                v,
+                group=rg,
+                causal=causal,
+                scaling=scaling,
+                dropout=dropout,
+                provider=provider,
+                rotate_method=rotate_method,
+                attn_implementation=attn_implementation,
+                window=window,
+            )  # [b, S/R, H/U, d]
         out = seq_all_to_all(out, scatter_dim=1, gather_dim=2, group=ug)
         return out, None
 

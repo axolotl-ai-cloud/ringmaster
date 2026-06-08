@@ -9,6 +9,8 @@ Ulysses is inherently balanced (zigzag is a Ring-only concern).
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 
 from ringmaster.comm import seq_all_to_all
@@ -30,6 +32,41 @@ def _resolve_inner(inner_name: str):
     return fn
 
 
+@lru_cache(maxsize=2)
+def _flash_varlen_fn(inner_name: str):
+    from transformers.modeling_flash_attention_utils import _lazy_imports
+
+    fn = _lazy_imports(inner_name)[1]
+    if fn is None:
+        raise RuntimeError(
+            f"varlen CP needs a flash kernel; '{inner_name}' has no flash_attn_varlen_func"
+        )
+    return fn
+
+
+def _ulysses_varlen(q, k, v, varlen, dropout, scaling, is_causal, inner_name):
+    """Packed-sequence attention on the head-sharded FULL sequence. After the Ulysses
+    all-to-all each rank holds the whole pack for a head subset, so flash varlen with
+    the GLOBAL cu_seqlens is exact. q/k/v: [1, Hsub, S, d] (b=1); returns [1, S, Hq, d]."""
+    if q.shape[0] != 1:
+        raise NotImplementedError(
+            "ringmaster varlen CP supports batch size 1 (packed sequences)."
+        )
+    cu, max_len = varlen
+    cu = cu.to(q.device)
+
+    def flat(t):  # [1, H, S, d] -> [S, H, d]
+        return t[0].transpose(0, 1).contiguous()
+
+    out = _flash_varlen_fn(inner_name)(
+        flat(q), flat(k), flat(v), cu, cu, max_len, max_len,
+        dropout, scaling, True if is_causal is None else is_causal,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    return out.unsqueeze(0)  # [1, S, Hq, d]
+
+
 def make_ulysses_attention(inner_name: str):
     """Build the AttentionInterface-compatible Ulysses forward for ``inner_name``."""
 
@@ -45,7 +82,8 @@ def make_ulysses_attention(inner_name: str):
         **kwargs,
     ):
         inner = _resolve_inner(inner_name)
-        group = get_runtime().ulysses_group
+        rt = get_runtime()
+        group = rt.ulysses_group
         import torch.distributed as dist
 
         world = dist.get_world_size(group) if group is not None else 1
@@ -95,28 +133,34 @@ def make_ulysses_attention(inner_name: str):
             )
             k, v = kv[0], kv[1]
 
-        # The flash integration reads module.config._attn_implementation to pick the
-        # kernel; it's currently our registered name, so restore the real inner kernel
-        # name for the duration of the inner call (dispatch already resolved to us).
-        cfg = getattr(module, "config", None)
-        saved = getattr(cfg, "_attn_implementation", None) if cfg is not None else None
-        if cfg is not None:
-            cfg._attn_implementation = inner_name
-        try:
-            attn_out, _ = inner(
-                module,
-                q,
-                k,
-                v,
-                None,
-                dropout=dropout,
-                scaling=scaling,
-                is_causal=True if is_causal is None else is_causal,
-                **kwargs,
+        if rt.varlen is not None:
+            # packed sequences: flash varlen over the gathered full pack (global cu_seqlens)
+            attn_out = _ulysses_varlen(
+                q, k, v, rt.varlen, dropout, scaling, is_causal, inner_name
             )
-        finally:
+        else:
+            # The flash integration reads module.config._attn_implementation to pick the
+            # kernel; it's currently our registered name, so restore the real inner kernel
+            # name for the duration of the inner call (dispatch already resolved to us).
+            cfg = getattr(module, "config", None)
+            saved = getattr(cfg, "_attn_implementation", None) if cfg is not None else None
             if cfg is not None:
-                cfg._attn_implementation = saved
+                cfg._attn_implementation = inner_name
+            try:
+                attn_out, _ = inner(
+                    module,
+                    q,
+                    k,
+                    v,
+                    None,
+                    dropout=dropout,
+                    scaling=scaling,
+                    is_causal=True if is_causal is None else is_causal,
+                    **kwargs,
+                )
+            finally:
+                if cfg is not None:
+                    cfg._attn_implementation = saved
 
         # inner returns [b, s, H/P, d]; scatter sequence, gather heads -> [b, s/P, H, d]
         attn_out = seq_all_to_all(

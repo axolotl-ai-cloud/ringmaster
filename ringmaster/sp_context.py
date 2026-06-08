@@ -13,7 +13,8 @@ import torch.distributed as dist
 
 from ringmaster.cp_collectives import seq_gather_cp
 from ringmaster.loss import correct_eval_loss, global_num_items_in_batch
-from ringmaster.shard import shard_batch
+from ringmaster.runtime import maybe_runtime
+from ringmaster.shard import shard_batch, varlen_meta
 
 
 def broadcast_batch(kwargs: dict, group, src: int | None = None) -> None:
@@ -106,11 +107,17 @@ class ContextParallelContextManager:
                 return remaining, kwargs
 
             broadcast_batch(kwargs, self.cp_group)
+            global_pos = kwargs.get("position_ids")  # full sequence, before sharding
             kwargs, info = shard_batch(
                 kwargs, cp_rank=self.cp_rank, cp_size=self.cp_size,
                 load_balance=self.load_balance,
             )
             self._orig_seq_len, self._pad_len = info.original_seq_len, info.pad_len
+            # stash packed-sequence cu_seqlens for the Ulysses varlen path (None clears
+            # any stale value from the previous step).
+            rt = maybe_runtime()
+            if rt is not None:
+                rt.varlen = varlen_meta(global_pos, info.original_seq_len + info.pad_len)
 
             # count valid tokens from shift_labels (what the model's loss uses)
             count_labels = kwargs.get("shift_labels")
