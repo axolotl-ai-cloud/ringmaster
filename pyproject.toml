@@ -1,18 +1,28 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=64", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ringmaster"
-version = "0.0.1"
+name = "axolotl-ringmaster"
+dynamic = ["version"]
 description = "Composable long-context attention: Ulysses / Ring / USP sequence parallelism for any framework"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Axolotl AI" }]
 license = { text = "Apache-2.0" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.11",
 ]
+
+[project.urls]
+Homepage = "https://github.com/axolotl-ai-cloud/ringmaster"
+Repository = "https://github.com/axolotl-ai-cloud/ringmaster"
 
 [project.optional-dependencies]
 transformers = ["transformers>=5.9"]
@@ -20,6 +30,9 @@ dev = ["pytest", "transformers>=5.9"]
 
 [tool.setuptools.packages.find]
 include = ["ringmaster*"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.1.dev0"
 
 [tool.pytest.ini_options]
 markers = [

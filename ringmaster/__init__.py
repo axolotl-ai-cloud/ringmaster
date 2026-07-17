@@ -15,7 +15,14 @@ Quick start (framework adapter does this for you)::
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from typing import TYPE_CHECKING, Optional
+
+try:
+    __version__ = _pkg_version("axolotl-ringmaster")
+except PackageNotFoundError:  # source tree without installed dist metadata
+    __version__ = "0.0.0"
 
 from ringmaster.compat import has_min_torch, require_torch
 from ringmaster.config import (
