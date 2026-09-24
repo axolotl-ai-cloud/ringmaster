@@ -256,4 +256,9 @@ class RingP2PAttention(torch.autograd.Function):
 
 def ring_p2p_attention(q, k, v, *, group, causal, scaling):
     """q/k/v: [b, H, s_local, d]. Returns [b, s_local, H, d] (interface output layout)."""
+    if q.shape[1] != k.shape[1] and (not q.is_cuda or _flash_ops() is None):
+        if q.shape[1] % k.shape[1]:
+            raise ValueError("Query heads must be divisible by KV heads")
+        repeats = q.shape[1] // k.shape[1]
+        k, v = (t.repeat_interleave(repeats, dim=1) for t in (k, v))
     return RingP2PAttention.apply(q, k, v, group, causal, scaling)

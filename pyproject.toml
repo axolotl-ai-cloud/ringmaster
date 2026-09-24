@@ -25,6 +25,7 @@ Homepage = "https://github.com/axolotl-ai-cloud/ringmaster"
 Repository = "https://github.com/axolotl-ai-cloud/ringmaster"
 
 [project.optional-dependencies]
+fla = ["flash-linear-attention[tilelang]==0.5.2", "tilelang==0.1.14"]
 transformers = ["transformers>=5.9"]
 dev = ["pytest", "transformers>=5.9"]
 

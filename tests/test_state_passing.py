@@ -20,7 +20,8 @@ def _worker(rank: int, world: int, out_q):
         torch.manual_seed(0)  # identical full sequence on every rank
         batch, total_len, d = 1, 8, 3
         a_full = torch.rand(batch, total_len, d) * 0.9 + 0.05  # decays in (0,1)
-        b_full = torch.randn(batch, total_len, d)
+        a_full.requires_grad_()
+        b_full = torch.randn(batch, total_len, d, requires_grad=True)
 
         # global reference
         ref = local_linear_scan(a_full, b_full)
@@ -28,7 +29,13 @@ def _worker(rank: int, world: int, out_q):
         # this rank's contiguous chunk
         local = total_len // world
         sl = slice(rank * local, (rank + 1) * local)
-        got = cp_linear_scan(a_full[:, sl], b_full[:, sl], dist.group.WORLD)
+        local_a = a_full[:, sl].detach().requires_grad_()
+        local_b = b_full[:, sl].detach().requires_grad_()
+        got = cp_linear_scan(local_a, local_b, dist.group.WORLD)
+        expected_grads = torch.autograd.grad(ref.square().sum(), (a_full, b_full))
+        actual_grads = torch.autograd.grad(got.square().sum(), (local_a, local_b))
+        for actual, expected in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual, expected[:, sl], atol=1e-5, rtol=1e-5)
 
         err = (got - ref[:, sl]).abs().max().item()
         out_q.put((rank, err))
@@ -96,7 +103,9 @@ def test_cp_gated_linear_attention_matches_global():
     world = 2
     ctx = mp.get_context("spawn")
     out_q = ctx.Queue()
-    procs = [ctx.Process(target=_gla_worker, args=(r, world, out_q)) for r in range(world)]
+    procs = [
+        ctx.Process(target=_gla_worker, args=(r, world, out_q)) for r in range(world)
+    ]
     for p in procs:
         p.start()
     results = [out_q.get(timeout=60) for _ in range(world)]

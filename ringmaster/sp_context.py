@@ -17,33 +17,7 @@ from ringmaster.runtime import maybe_runtime
 from ringmaster.shard import shard_batch, varlen_meta
 
 
-def broadcast_batch(kwargs: dict, group, src: int | None = None) -> None:
-    """Broadcast every sequence tensor in ``kwargs`` from ``src`` across ``group``.
-
-    Shape-safe: agree on the source shape first, else an in-place broadcast writes
-    the payload into a smaller local buffer (variable-length samples) → OOB.
-    """
-    if group is None or dist.get_world_size(group) == 1:
-        return
-    if src is None:
-        src = dist.get_process_group_ranks(group)[0]
-    is_src = dist.get_rank(group) == src
-    for key, val in list(kwargs.items()):
-        if not isinstance(val, torch.Tensor) or val.dim() < 1:
-            continue
-        ndim = torch.tensor([val.dim()], device=val.device)
-        dist.broadcast(ndim, src=src, group=group)
-        if is_src:
-            shape = torch.tensor(val.shape, dtype=torch.long, device=val.device)
-        else:
-            shape = torch.empty(int(ndim.item()), dtype=torch.long, device=val.device)
-        dist.broadcast(shape, src=src, group=group)
-        shape = torch.Size(shape.tolist())
-        t = val.contiguous() if val.shape == shape else torch.empty(
-            shape, dtype=val.dtype, device=val.device
-        )
-        dist.broadcast(t, src=src, group=group)
-        kwargs[key] = t
+from ringmaster.batch import broadcast_batch
 
 
 class ContextParallelContextManager:
@@ -100,16 +74,29 @@ class ContextParallelContextManager:
             for i, arg in enumerate(args):
                 if i < len(forward_params):
                     kwargs[forward_params[i]] = arg
-            remaining = args[len(forward_params):]
+            remaining = args[len(forward_params) :]
 
             ids = kwargs.get("input_ids")
             if ids is None or self.cp_size == 1:
                 return remaining, kwargs
 
             broadcast_batch(kwargs, self.cp_group)
+            mask = kwargs.get("attention_mask")
+            if mask is not None:
+                if (
+                    mask.ndim != 2
+                    or not torch.all((mask == 0) | (mask == 1))
+                    or torch.any(mask[:, 1:] > mask[:, :-1])
+                ):
+                    raise ValueError(
+                        "Context parallelism requires dense or right-padded causal sequences"
+                    )
+                kwargs.pop("attention_mask")
             global_pos = kwargs.get("position_ids")  # full sequence, before sharding
             kwargs, info = shard_batch(
-                kwargs, cp_rank=self.cp_rank, cp_size=self.cp_size,
+                kwargs,
+                cp_rank=self.cp_rank,
+                cp_size=self.cp_size,
                 load_balance=self.load_balance,
             )
             self._orig_seq_len, self._pad_len = info.original_seq_len, info.pad_len
@@ -117,7 +104,9 @@ class ContextParallelContextManager:
             # any stale value from the previous step).
             rt = maybe_runtime()
             if rt is not None:
-                rt.varlen = varlen_meta(global_pos, info.original_seq_len + info.pad_len)
+                rt.varlen = varlen_meta(
+                    global_pos, info.original_seq_len + info.pad_len
+                )
 
             # count valid tokens from shift_labels (what the model's loss uses)
             count_labels = kwargs.get("shift_labels")
@@ -141,7 +130,11 @@ class ContextParallelContextManager:
             # GRPO/EBFT use it; zigzag would need the inverse permutation).
             local_len = (self._orig_seq_len + self._pad_len) // self.cp_size
             for key, val in list(output.items()):
-                if isinstance(val, torch.Tensor) and val.dim() > 1 and val.size(1) == local_len:
+                if (
+                    isinstance(val, torch.Tensor)
+                    and val.dim() > 1
+                    and val.size(1) == local_len
+                ):
                     gathered = seq_gather_cp(val, self.cp_group)
                     if self._pad_len:
                         gathered = gathered[:, : self._orig_seq_len].contiguous()

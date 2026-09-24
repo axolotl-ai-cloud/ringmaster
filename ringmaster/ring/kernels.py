@@ -55,6 +55,11 @@ def math_block(q, k, v, *, causal, scaling, dropout=0.0, attn_implementation=Non
     """Reference block via explicit softmax. Autograd-aware and CPU-capable, so the
     ring/USP loops can be validated on gloo without GPUs or flash. q/k/v: [b, s, h, d]."""
     qt, kt, vt = (t.transpose(1, 2).float() for t in (q, k, v))  # [b, h, s, d]
+    if qt.shape[1] != kt.shape[1]:
+        if qt.shape[1] % kt.shape[1]:
+            raise ValueError("Query heads must be divisible by KV heads")
+        repeats = qt.shape[1] // kt.shape[1]
+        kt, vt = (t.repeat_interleave(repeats, dim=1) for t in (kt, vt))
     scale = scaling if scaling is not None else 1.0 / math.sqrt(qt.shape[-1])
     scores = (qt @ kt.transpose(-1, -2)) * scale  # [b, h, sq, sk]
     sq, sk = scores.shape[-2], scores.shape[-1]
@@ -69,6 +74,8 @@ def math_block(q, k, v, *, causal, scaling, dropout=0.0, attn_implementation=Non
         scores = scores.masked_fill(idx_q - idx_k > left, float("-inf"))
     lse = torch.logsumexp(scores, dim=-1)  # [b, h, sq]
     probs = torch.exp(scores - lse.unsqueeze(-1))
+    if dropout:
+        probs = torch.nn.functional.dropout(probs, p=dropout)
     out = probs @ vt  # [b, h, sq, d]
     return out.transpose(1, 2).to(q.dtype), lse
 

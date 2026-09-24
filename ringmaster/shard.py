@@ -31,10 +31,12 @@ def cu_seqlens_from_position_ids(position_ids):
     starts = (pos == 0).nonzero(as_tuple=False).view(-1)
     if starts.numel() <= position_ids.shape[0]:
         return None
-    cu = torch.cat([
-        starts.to(torch.int32),
-        torch.tensor([pos.numel()], dtype=torch.int32, device=pos.device),
-    ])
+    cu = torch.cat(
+        [
+            starts.to(torch.int32),
+            torch.tensor([pos.numel()], dtype=torch.int32, device=pos.device),
+        ]
+    )
     return cu, int(cu.diff().max().item())
 
 
@@ -77,32 +79,42 @@ def _pad_to(batch, seq_len, pad_len):
         if isinstance(val, torch.Tensor) and val.dim() > 1 and val.size(1) == seq_len:
             pad_value = -100 if key in ("labels", "shift_labels") else 0
             pad = torch.full(
-                (val.size(0), pad_len, *val.shape[2:]), pad_value,
-                dtype=val.dtype, device=val.device,
+                (val.size(0), pad_len, *val.shape[2:]),
+                pad_value,
+                dtype=val.dtype,
+                device=val.device,
             )
+            if key == "position_ids" and val.ndim == 2:
+                pad = val[:, -1:] + torch.arange(
+                    1, pad_len + 1, device=val.device, dtype=val.dtype
+                )
             batch[key] = torch.cat([val, pad], dim=1)
     return seq_len + pad_len
 
 
 def _zigzag_shard(batch, cp_rank, cp_size):
     """Zigzag (head_tail) shard: rank holds chunks [r, 2W-1-r] (balances the causal ring)."""
-    bsz, seq_len = batch["input_ids"].shape
+    bsz, seq_len = batch["input_ids"].shape[:2]
     device = batch["input_ids"].device
     pad_len = _pad_multiple(seq_len, 2 * cp_size)
 
     _ensure_global_shift_labels(batch)
     if batch.get("position_ids") is None:
         batch["position_ids"] = (
-            torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0).expand(bsz, -1)
+            torch.arange(0, seq_len, dtype=torch.long, device=device)
+            .unsqueeze(0)
+            .expand(bsz, -1)
         )
 
     total = _pad_to(batch, seq_len, pad_len)
     half = total // (2 * cp_size)
     lo, hi = cp_rank, 2 * cp_size - 1 - cp_rank
-    idx = torch.cat([
-        torch.arange(lo * half, (lo + 1) * half, device=device),
-        torch.arange(hi * half, (hi + 1) * half, device=device),
-    ])
+    idx = torch.cat(
+        [
+            torch.arange(lo * half, (lo + 1) * half, device=device),
+            torch.arange(hi * half, (hi + 1) * half, device=device),
+        ]
+    )
     for key, val in list(batch.items()):
         if isinstance(val, torch.Tensor) and val.dim() > 1 and val.size(1) == total:
             batch[key] = val.index_select(1, idx).contiguous()
@@ -132,7 +144,7 @@ def shard_batch(
     if load_balance == "head_tail":
         return _zigzag_shard(batch, cp_rank, cp_size)
 
-    bsz, seq_len = batch["input_ids"].shape
+    bsz, seq_len = batch["input_ids"].shape[:2]
     device = batch["input_ids"].device
     pad_len = _pad_multiple(seq_len, cp_size)
 
