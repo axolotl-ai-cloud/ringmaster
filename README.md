@@ -42,7 +42,7 @@ import ringmaster as rm
 cfg = rm.RingmasterConfig(size=8, backend=rm.Backend.AUTO)
 runtime = rm.setup(cfg, num_kv_heads=8, device_mesh=mesh)   # mesh has a "cp" dim
 model.set_attn_implementation(runtime.attn_implementation)
-rm.wire_recurrent_layers(model)                             # no-op for plain attention
+wiring = rm.wire_recurrent_layers(model)                    # no-op for plain attention
 
 from ringmaster.adapters.raw import context_parallel_region
 for batch in loader:
@@ -146,3 +146,23 @@ ringmaster/
   adapters/        raw PyTorch / trl+accelerate / hatchery-core entry points
   benchmarks/      profile_cp.py (comm + memory across seq lengths)
 ```
+
+### Native recurrent context parallelism
+
+Install `axolotl-ringmaster[fla]` for the native FLA GDN and KDA adapters.
+`wire_recurrent_layers(model)` detects supported mixer contracts, installs
+instance-local adapters, and returns a wiring object whose `restore()` method
+undoes those changes. Install selected Hub kernels before wiring Mamba adapters;
+the adapter captures the selected fused-kernel semantics at installation.
+Unknown recurrent mixers fail during preflight. No model
+architecture allowlist is required.
+
+GDN and KDA currently require batch size one, contiguous unpacked shards, and
+caching disabled. Transformers Mamba2 adapters exchange convolution halos and
+scan states; packing metadata remains the caller's responsibility and packed
+Mamba CP is rejected. Use a contiguous layout for all recurrent models.
+
+Attention accepts dense causal sequences or globally right-padded batches through
+the context manager. Left padding, holes, and arbitrary attention masks are
+rejected. Packed attention uses global position boundaries; recurrent packing
+combined with CP is not supported by these adapters.

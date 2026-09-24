@@ -57,6 +57,11 @@ def make_ring_attention(provider: str, attn_implementation: str, rotate_method: 
         from ringmaster.config import LoadBalance
 
         multi = group is not None and dist.get_world_size(group) > 1
+        if multi and attention_mask is not None:
+            raise ValueError("Ring attention requires an unpadded causal sequence; attention_mask is unsupported")
+        if multi and rt.config.load_balance in (LoadBalance.HEAD_TAIL, LoadBalance.DISTFLASH):
+            if dropout or window is not None or attn_implementation not in ("flash_attention_2", "math"):
+                raise ValueError("Balanced Ring requires FA2, zero dropout, and no sliding window")
         # Packed sequences: distflash keeps its balanced schedule with doc-masked
         # blocks; plain ring (and zigzag, for now) use the contiguous doc-masked path.
         if rt.varlen is not None and multi:

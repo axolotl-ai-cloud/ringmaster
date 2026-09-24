@@ -21,7 +21,7 @@ def _worker(rank, world, out_q):
         from ringmaster.ring.kernels import math_block
         from ringmaster.strategies.usp import make_usp_attention
 
-        runtime = rm.setup(
+        rm.setup(
             rm.RingmasterConfig(
                 size=world, backend=rm.Backend.USP, ulysses_size=2, ring_size=2
             ),
@@ -33,24 +33,31 @@ def _worker(rank, world, out_q):
 
         torch.manual_seed(0)  # identical full tensors on every rank
         b, h, total, d = 1, 4, 8, 16
-        qf = torch.randn(b, h, total, d, dtype=torch.float64)
-        kf = torch.randn(b, h, total, d, dtype=torch.float64)
-        vf = torch.randn(b, h, total, d, dtype=torch.float64)
+        qf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
+        kf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
+        vf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
 
         ref, _ = math_block(
-            qf.transpose(1, 2), kf.transpose(1, 2), vf.transpose(1, 2),
-            causal=True, scaling=None,
+            qf.transpose(1, 2),
+            kf.transpose(1, 2),
+            vf.transpose(1, 2),
+            causal=True,
+            scaling=None,
         )  # [b, total, h, d]
 
         local = total // world
         sl = slice(rank * local, (rank + 1) * local)
-        q = qf[:, :, sl].contiguous()
-        k = kf[:, :, sl].contiguous()
-        v = vf[:, :, sl].contiguous()
+        q = qf[:, :, sl].detach().contiguous().requires_grad_()
+        k = kf[:, :, sl].detach().contiguous().requires_grad_()
+        v = vf[:, :, sl].detach().contiguous().requires_grad_()
 
         usp_fwd = make_usp_attention("math", "math", RotateMethod.ALLGATHER)
-        with torch.no_grad():
-            out, _ = usp_fwd(None, q, k, v, None, scaling=None, is_causal=True)
+        out, _ = usp_fwd(None, q, k, v, None, scaling=None, is_causal=True)
+        grad = torch.randn_like(ref)
+        expected_grads = torch.autograd.grad((ref * grad).sum(), (qf, kf, vf))
+        actual_grads = torch.autograd.grad((out * grad[:, sl]).sum(), (q, k, v))
+        for actual, expected in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual, expected[:, :, sl], atol=1e-6, rtol=1e-5)
         # out: [b, s_local, h, d]; gather across ranks to rebuild the full sequence
         gathered = [torch.empty_like(out) for _ in range(world)]
         dist.all_gather(gathered, out.contiguous(), group=dist.group.WORLD)

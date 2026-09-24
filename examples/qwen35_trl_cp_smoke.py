@@ -1,9 +1,6 @@
 """TRL SFTTrainer + ringmaster CP e2e smoke on a REAL Qwen3.5 (gated-delta linear attn).
 
-Unlike examples/trl_cp.py (SmolLM2, standard attention), this exercises the
-Qwen3.5 gated-delta linear-attention CP path — the one that needs the sm_120
-TileLang warp-spec shim. It mirrors the axolotl plugin's _wire_recurrent_layers
-so the TRL and axolotl smokes run the same ringmaster wiring.
+This exercises native FLA gated-delta state passing through the shared recurrent API.
 
 CP / TRL integration: a trainer subclass broadcasts each batch across the CP
 group (all CP ranks must see the SAME sample), builds pre-shifted ``shift_labels``,
@@ -14,7 +11,7 @@ sharded logits line up with sharded targets.
 
     accelerate launch --num_processes 2 qwen35_trl_cp_smoke.py
 """
-import os
+
 import torch
 import torch.distributed as dist
 from datasets import Dataset
@@ -22,12 +19,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTConfig, SFTTrainer
 
 import ringmaster as rm
-from ringmaster.strategies.linear_attn import (
-    _fla_backward_ok,
-    _fla_has_cp_context,
-    wrap_linear_attn_instance,
-)
-from ringmaster.strategies.state_passing import is_recurrent_mixer
 
 MODEL_ID = "Qwen/Qwen3.5-4B"
 
@@ -39,7 +30,9 @@ class CPSFTTrainer(SFTTrainer):
         super().__init__(*a, **k)
         self._cp = cp_runtime
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         rt = self._cp
         if rt is not None and rt.cp_size > 1 and inputs.get("input_ids") is not None:
             from ringmaster import broadcast_batch
@@ -71,16 +64,24 @@ class CPSFTTrainer(SFTTrainer):
                     attn = torch.cat([attn, attn.new_zeros(bsz, pad)], 1)
 
             r = rt.cp_rank
-            sl = lambda t: t.chunk(cp, dim=1)[r].contiguous()
+
+            def sl(t):
+                return t.chunk(cp, dim=1)[r].contiguous()
+
             inputs = dict(inputs)
             inputs["input_ids"] = sl(ids)
             inputs["shift_labels"] = sl(shift)
-            inputs["labels"] = sl(ids)  # non-None so the model takes the loss path; shift_labels wins
+            inputs["labels"] = sl(
+                ids
+            )  # non-None so the model takes the loss path; shift_labels wins
             inputs["position_ids"] = sl(pos)
             if attn is not None:
                 inputs["attention_mask"] = sl(attn)
         return super().compute_loss(
-            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
         )
 
 
@@ -104,23 +105,13 @@ def main():
     )
     model.set_attn_implementation(runtime.attn_implementation)
 
-    # mirror axolotl ContextParallelPlugin._wire_recurrent_layers
     text_cfg = getattr(model.config, "get_text_config", lambda: model.config)()
-    conv_k = getattr(text_cfg, "linear_conv_kernel_dim", 4)
-    n_linear = 0
-    for module in model.modules():
-        if is_recurrent_mixer(module) and hasattr(module, "chunk_gated_delta_rule"):
-            wrap_linear_attn_instance(module, conv_k)
-            n_linear += 1
-
+    text_cfg.use_cache = False
+    wiring = rm.wire_recurrent_layers(model)
     if rank == 0:
-        native = _fla_has_cp_context() and _fla_backward_ok()
         print(
             f"[trl_cp] model={MODEL_ID} CP backend=ring size={world} "
-            f"attn={runtime.attn_implementation} linear_mixers_wired={n_linear} "
-            f"PATH={'native' if native else 'torch_fallback'} "
-            f"(cp_context={_fla_has_cp_context()}, bwd_ok={_fla_backward_ok()}, "
-            f"dispatch_disabled={os.environ.get('FLA_DISABLE_BACKEND_DISPATCH')})",
+            f"attn={runtime.attn_implementation} linear_mixers_wired={wiring.linear_attn_mixers}",
             flush=True,
         )
 
@@ -142,12 +133,18 @@ def main():
         optim="adamw_torch",
     )
     trainer = CPSFTTrainer(
-        model=model, args=args, train_dataset=ds, processing_class=tok, cp_runtime=runtime
+        model=model,
+        args=args,
+        train_dataset=ds,
+        processing_class=tok,
+        cp_runtime=runtime,
     )
     trainer.train()
     if rank == 0:
         losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
         print(f"[trl_cp] DONE losses={losses}", flush=True)
+    wiring.restore()
+    rm.teardown()
     dist.destroy_process_group()
 
 

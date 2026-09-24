@@ -38,7 +38,6 @@ fork required):
 
 import argparse
 import contextlib
-import os
 
 import torch
 import torch.distributed as dist
@@ -71,7 +70,9 @@ class CPSFTTrainer(SFTTrainer):
             return contextlib.nullcontext, inputs  # ringmaster ring attention owns CP
         return super()._prepare_context_parallel_inputs(model, inputs)
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
         rt = self._cp
         if rt is not None and rt.cp_size > 1 and inputs.get("input_ids") is not None:
             broadcast_batch(inputs, rt.cp_group)  # every CP rank: the SAME sample
@@ -83,7 +84,9 @@ class CPSFTTrainer(SFTTrainer):
 
             labels = inputs.get("labels")
             labels = ids if labels is None else labels
-            shift = torch.full_like(labels, -100)  # shift[t] is the target for position t
+            shift = torch.full_like(
+                labels, -100
+            )  # shift[t] is the target for position t
             shift[:, :-1] = labels[:, 1:]
             attn = inputs.get("attention_mask")
             pos = torch.arange(seqlen, device=dev).unsqueeze(0).expand(bsz, -1)
@@ -95,20 +98,30 @@ class CPSFTTrainer(SFTTrainer):
                     attn = torch.cat([attn, attn.new_zeros(bsz, pad)], 1)
 
             r = rt.cp_rank
-            sl = lambda t: t.chunk(cp, dim=1)[r].contiguous()  # contiguous shard
+
+            def sl(t):
+                return t.chunk(cp, dim=1)[r].contiguous()
+
             inputs = dict(inputs)
             inputs["input_ids"] = sl(ids)
             inputs["shift_labels"] = sl(shift)
-            inputs["labels"] = sl(ids)  # non-None so the model takes its loss path; shift_labels wins
+            inputs["labels"] = sl(
+                ids
+            )  # non-None so the model takes its loss path; shift_labels wins
             inputs["position_ids"] = sl(pos)
             if attn is not None:
                 inputs["attention_mask"] = sl(attn)
             if num_items_in_batch is not None:
                 num_items_in_batch = global_num_items_in_batch(
-                    inputs["shift_labels"], rt.cp_group, self.args.gradient_accumulation_steps
+                    inputs["shift_labels"],
+                    rt.cp_group,
+                    self.args.gradient_accumulation_steps,
                 )
         return super().compute_loss(
-            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch
+            model,
+            inputs,
+            return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
         )
 
 
@@ -118,6 +131,7 @@ def maybe_apply_sm120_shims():
     No-op elsewhere. Must run before the model loads."""
     try:
         from ringmaster.strategies.linear_attn import _apply_fla_sm120_shim
+
         _apply_fla_sm120_shim()
     except Exception:
         pass
@@ -126,6 +140,7 @@ def maybe_apply_sm120_shims():
             ensure_causal_conv1d_cuda_export,
             prefer_local_mamba_kernels,
         )
+
         prefer_local_mamba_kernels()
         ensure_causal_conv1d_cuda_export()
     except Exception:
@@ -136,7 +151,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="HuggingFaceTB/SmolLM2-135M")
     ap.add_argument("--seq-len", type=int, default=8192)
-    ap.add_argument("--cp-size", type=int, default=0, help="CP degree (default: whole world)")
+    ap.add_argument(
+        "--cp-size", type=int, default=0, help="CP degree (default: whole world)"
+    )
     ap.add_argument("--max-steps", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--no-fsdp", action="store_true", help="disable FSDP2 (pure CP)")
@@ -170,15 +187,20 @@ def main():
     # Liger only patches some arches; fall back to chunked_nll where it doesn't (e.g.
     # Nemotron-H), since a silent no-op would drop to full-logits CE and OOM.
     from liger_kernel.transformers.monkey_patch import MODEL_TYPE_TO_APPLY_LIGER_FN
+
     use_liger = model.config.model_type in MODEL_TYPE_TO_APPLY_LIGER_FN
-    loss_kwargs = {"use_liger_kernel": True} if use_liger else {"loss_type": "chunked_nll"}
+    loss_kwargs = (
+        {"use_liger_kernel": True} if use_liger else {"loss_type": "chunked_nll"}
+    )
 
     # accelerate builds the dp_shard x cp mesh; FSDP2 shards/reduces over dp_shard_cp.
     pc = ParallelismConfig(cp_size=cp, dp_shard_size=dp_shard)
     fsdp_kwargs = {}
     if not args.no_fsdp:
         present = {type(m).__name__ for m in model.modules()}
-        layers = [c for c in (getattr(model, "_no_split_modules", None) or []) if c in present]
+        layers = [
+            c for c in (getattr(model, "_no_split_modules", None) or []) if c in present
+        ]
         fsdp_kwargs = dict(
             fsdp="full_shard auto_wrap",
             fsdp_config={
@@ -205,7 +227,9 @@ def main():
         **loss_kwargs,
         **fsdp_kwargs,
     )
-    trainer = CPSFTTrainer(model=model, args=sft, train_dataset=ds, processing_class=tok)
+    trainer = CPSFTTrainer(
+        model=model, args=sft, train_dataset=ds, processing_class=tok
+    )
 
     # Wire ringmaster from the accelerator's device mesh (reads the "cp" dim), swap in
     # ring attention, and wire any recurrent (Mamba/linear-attention) layers for CP.
@@ -216,6 +240,8 @@ def main():
         cp_dim="cp",
     )
     model.set_attn_implementation(runtime.attn_implementation)
+    text_cfg = getattr(model.config, "get_text_config", lambda: model.config)()
+    text_cfg.use_cache = False
     wiring = wire_recurrent_layers(model)
     trainer._cp = runtime
 
@@ -232,6 +258,8 @@ def main():
     if rank == 0:
         losses = [h["loss"] for h in trainer.state.log_history if "loss" in h]
         print(f"[trl_cp_fsdp2] DONE losses={losses}", flush=True)
+    wiring.restore()
+    rm.teardown()
     dist.destroy_process_group()
 
 
