@@ -81,7 +81,7 @@ Requires **torch ≥ 2.11**.
 | 5 | ALST memory | deferred to host framework (axolotl-native) |
 | 6 | Profiling, trl/accelerate + multimodal adapters, **accelerate ParallelismConfig compat**, benchmark, docs, axolotl plugin (schema-merge tested) | ✅ |
 | 7 | Custom collectives — fused Q/K/V all-to-all (MHA) ✅; **comm/compute overlap (prefetch) in p2p ring** ✅; symmetric-memory / Triton | partial (two items done) |
-| v2 | packing / varlen | deferred |
+| v2 | packing / varlen | global document metadata; attention and recurrent CP |
 
 ## Benchmark (2× GPU, Ulysses, Llama hidden=2048/heads=16/layers=6, fwd+bwd)
 
@@ -157,12 +157,15 @@ the adapter captures the selected fused-kernel semantics at installation.
 Unknown recurrent mixers fail during preflight. No model
 architecture allowlist is required.
 
-GDN and KDA currently require batch size one, contiguous unpacked shards, and
-caching disabled. Transformers Mamba2 adapters exchange convolution halos and
-scan states; packing metadata remains the caller's responsibility and packed
-Mamba CP is rejected. Use a contiguous layout for all recurrent models.
+GDN and KDA require a single flattened batch row, contiguous shards, and caching
+disabled. Packed document boundaries are passed to native FLA CP contexts.
+Transformers Mamba2 adapters exchange convolution halos and scan states while
+resetting both at document boundaries. Use a contiguous layout for recurrent models.
 
 Attention accepts dense causal sequences or globally right-padded batches through
 the context manager. Left padding, holes, and arbitrary attention masks are
-rejected. Packed attention uses global position boundaries; recurrent packing
-combined with CP is not supported by these adapters.
+rejected. The context manager accepts packed position IDs, document-ID masks, or
+global cumulative sequence lengths from a flattening collator. It preserves these
+boundaries across CP padding and sharding for attention and recurrent layers.
+Packed Ring/USP FlashAttention gathers K/V and uses per-document variable-length
+attention; its memory use includes the gathered global K/V tensors.

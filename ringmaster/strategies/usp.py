@@ -121,7 +121,18 @@ def make_usp_attention(provider: str, attn_implementation: str, rotate_method):
         if rt.varlen is not None:
             from ringmaster.ring.loop import varlen_ring_attention
 
-            out = varlen_ring_attention(q, k, v, group=rg, scaling=scaling, cu_seqlens=rt.varlen[0])
+            out = varlen_ring_attention(
+                q,
+                k,
+                v,
+                group=rg,
+                scaling=scaling,
+                cu_seqlens=rt.varlen[0],
+                causal=causal,
+                dropout=dropout,
+                window=window,
+                attn_implementation=attn_implementation,
+            )
         else:
             out = ring_attention(
                 q,

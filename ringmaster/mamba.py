@@ -30,6 +30,17 @@ def _bindings(raw, group):
     original_conv = raw.__globals__["causal_conv1d_fn"]
     rank = dist.get_rank(group)
 
+    def document_ids(x, length):
+        from ringmaster.runtime import maybe_runtime
+        from ringmaster.ring.varlen_blocks import doc_ids_from_cu as _doc_ids
+
+        runtime = maybe_runtime()
+        if runtime is None or runtime.varlen is None:
+            return None
+        return _doc_ids(runtime.varlen[0], x.device).reshape(
+            x.shape[0], length * dist.get_world_size(group)
+        )
+
     def conv(x, weight, bias=None, activation=None, **kwargs):
         width = weight.shape[-1] - 1
         if width == 0:
@@ -40,28 +51,93 @@ def _bindings(raw, group):
             )
         halos = all_gather_cp(x[..., -width:].contiguous(), group)
         prefix = halos[rank - 1] if rank else torch.zeros_like(halos[0])
-        output = original_conv(
-            torch.cat((prefix, x), dim=-1),
-            weight,
-            bias,
-            activation=activation,
-            **kwargs,
-        )[..., width:]
+        documents = document_ids(x, x.shape[-1])
+        if documents is None:
+            output = original_conv(
+                torch.cat((prefix, x), dim=-1),
+                weight,
+                bias,
+                activation=activation,
+                **kwargs,
+            )[..., width:]
+        else:
+            kwargs.pop("seq_idx", None)
+            rows = []
+            length = x.shape[-1]
+            for row in range(x.shape[0]):
+                local_docs = documents[row, rank * length : (rank + 1) * length]
+                starts = torch.cat(
+                    (
+                        local_docs.new_zeros(1),
+                        (local_docs[1:] != local_docs[:-1]).nonzero().flatten() + 1,
+                        local_docs.new_tensor([length]),
+                    )
+                ).tolist()
+                parts = []
+                for start, end in zip(starts[:-1], starts[1:]):
+                    values = x[row : row + 1, :, start:end]
+                    if start == 0 and rank:
+                        prefix_docs = documents[
+                            row, rank * length - width : rank * length
+                        ]
+                        history = prefix[row : row + 1] * (
+                            prefix_docs == local_docs[0]
+                        ).to(x.dtype)
+                        values = torch.cat((history, values), dim=-1)
+                    length_before_pad = values.shape[-1]
+                    # Hub convolution backward requires aligned strides for singleton slices.
+                    values = torch.nn.functional.pad(
+                        values, (0, -length_before_pad % 8)
+                    ).contiguous()
+                    result = original_conv(
+                        values, weight, bias, activation=activation, **kwargs
+                    )[..., :length_before_pad]
+                    parts.append(result[..., -(end - start) :])
+                rows.append(torch.cat(parts, dim=-1))
+            output = torch.cat(rows, dim=0)
         # Every rank must participate in the halo's backward collective.
         return output + (halos.float().sum() * 0).to(output.dtype)
 
     def scan(x, dt, A, B, C, chunk_size, **kwargs):
-        if (
-            kwargs.get("initial_states") is not None
-            or kwargs.get("seq_idx") is not None
-        ):
-            raise ValueError("Mamba CP requires uncached, unpacked sequences")
+        if kwargs.get("initial_states") is not None:
+            raise ValueError("Mamba CP requires uncached sequences")
         if kwargs.get("z") is not None:
             raise ValueError("Mamba CP requires gating outside the scan")
         want_final = kwargs.pop("return_final_states", False)
-        output, final = original_scan(
-            x, dt, A, B, C, chunk_size, **kwargs, return_final_states=True
-        )
+        documents = document_ids(x, x.shape[1])
+        if documents is None:
+            output, final = original_scan(
+                x, dt, A, B, C, chunk_size, **kwargs, return_final_states=True
+            )
+        else:
+            kwargs.pop("seq_idx", None)
+            rows, finals = [], []
+            length = x.shape[1]
+            for row in range(x.shape[0]):
+                local_docs = documents[row, rank * length : (rank + 1) * length]
+                starts = torch.cat(
+                    (
+                        local_docs.new_zeros(1),
+                        (local_docs[1:] != local_docs[:-1]).nonzero().flatten() + 1,
+                        local_docs.new_tensor([length]),
+                    )
+                ).tolist()
+                parts = []
+                for start, end in zip(starts[:-1], starts[1:]):
+                    result, state = original_scan(
+                        x[row : row + 1, start:end],
+                        dt[row : row + 1, start:end],
+                        A,
+                        B[row : row + 1, start:end],
+                        C[row : row + 1, start:end],
+                        chunk_size,
+                        **kwargs,
+                        return_final_states=True,
+                    )
+                    parts.append(result)
+                rows.append(torch.cat(parts, dim=1))
+                finals.append(state)
+            output, final = torch.cat(rows), torch.cat(finals)
         effective_dt = dt.float()
         if kwargs.get("dt_bias") is not None:
             effective_dt = effective_dt + kwargs["dt_bias"].float()
@@ -70,6 +146,13 @@ def _bindings(raw, group):
         effective_dt = effective_dt.clamp(*kwargs.get("dt_limit", (0.0, float("inf"))))
         cumulative = (effective_dt * A.float()).cumsum(1)
         decay = cumulative[:, -1].exp()
+        continuation = None
+        if documents is not None:
+            length = x.shape[1]
+            local_docs = documents[:, rank * length : (rank + 1) * length]
+            previous = documents[:, rank * length - 1] if rank else local_docs[:, 0] - 1
+            continuation = local_docs == previous[:, None]
+            decay = decay * continuation.all(dim=1, keepdim=True)
         batch, heads = decay.shape
         packed = torch.cat((decay, final.float().reshape(batch, -1)), dim=1)
         states = all_gather_cp(packed, group)
@@ -81,6 +164,8 @@ def _bindings(raw, group):
         expanded_c = C.float().repeat_interleave(heads // C.shape[2], dim=2)
         correction = torch.einsum("bthn,bhdn->bthd", expanded_c, entering)
         correction = correction * cumulative.exp().unsqueeze(-1)
+        if continuation is not None:
+            correction = correction * continuation[:, :, None, None]
         output = (
             output + correction.to(output.dtype) + (states.sum() * 0).to(output.dtype)
         )

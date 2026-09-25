@@ -44,27 +44,55 @@ def _flash_varlen_fn(inner_name: str):
     return fn
 
 
-def _ulysses_varlen(q, k, v, varlen, dropout, scaling, is_causal, inner_name):
+def _ulysses_varlen(
+    q, k, v, varlen, dropout, scaling, is_causal, inner_name, sliding_window=None
+):
     """Packed-sequence attention on the head-sharded FULL sequence. After the Ulysses
     all-to-all each rank holds the whole pack for a head subset, so flash varlen with
-    the GLOBAL cu_seqlens is exact. q/k/v: [1, Hsub, S, d] (b=1); returns [1, S, Hq, d]."""
-    if q.shape[0] != 1:
-        raise NotImplementedError(
-            "ringmaster varlen CP supports batch size 1 (packed sequences)."
-        )
+    the GLOBAL cu_seqlens is exact. q/k/v: [B, Hsub, S, d]; returns [B, S, Hq, d]."""
     cu, max_len = varlen
     cu = cu.to(q.device)
 
-    def flat(t):  # [1, H, S, d] -> [S, H, d]
-        return t[0].transpose(0, 1).contiguous()
+    if inner_name in ("sdpa", "flex_attention"):
+        lengths = cu.diff().long()
+        doc = torch.repeat_interleave(
+            torch.arange(len(lengths), device=q.device), lengths
+        ).reshape(q.shape[0], q.shape[2])
+        pos = torch.arange(q.shape[2], device=q.device)
+        allowed = doc[:, :, None] == doc[:, None, :]
+        if is_causal is not False:
+            allowed &= pos[:, None] >= pos[None, :]
+        if sliding_window:
+            allowed &= pos[:, None] - pos[None, :] < sliding_window
+        return torch.nn.functional.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=allowed[:, None],
+            dropout_p=dropout,
+            scale=scaling,
+            enable_gqa=q.shape[1] != k.shape[1],
+        ).transpose(1, 2)
+
+    def flat(t):
+        return t.transpose(1, 2).reshape(-1, t.shape[1], t.shape[-1]).contiguous()
 
     out = _flash_varlen_fn(inner_name)(
-        flat(q), flat(k), flat(v), cu, cu, max_len, max_len,
-        dropout, scaling, True if is_causal is None else is_causal,
+        flat(q),
+        flat(k),
+        flat(v),
+        cu,
+        cu,
+        max_len,
+        max_len,
+        dropout_p=dropout,
+        softmax_scale=scaling,
+        causal=True if is_causal is None else is_causal,
+        **({"window_size": (sliding_window - 1, 0)} if sliding_window else {}),
     )
     if isinstance(out, tuple):
         out = out[0]
-    return out.unsqueeze(0)  # [1, S, Hq, d]
+    return out.reshape(q.shape[0], q.shape[2], q.shape[1], q.shape[3])
 
 
 def make_ulysses_attention(inner_name: str):
@@ -129,21 +157,34 @@ def make_ulysses_attention(inner_name: str):
         else:
             q = seq_all_to_all(query, scatter_dim=1, gather_dim=2, group=group)
             kv = seq_all_to_all(
-                torch.stack((key, value), dim=0), scatter_dim=2, gather_dim=3, group=group
+                torch.stack((key, value), dim=0),
+                scatter_dim=2,
+                gather_dim=3,
+                group=group,
             )
             k, v = kv[0], kv[1]
 
         if rt.varlen is not None:
             # packed sequences: flash varlen over the gathered full pack (global cu_seqlens)
             attn_out = _ulysses_varlen(
-                q, k, v, rt.varlen, dropout, scaling, is_causal, inner_name
+                q,
+                k,
+                v,
+                rt.varlen,
+                dropout,
+                scaling,
+                is_causal,
+                inner_name,
+                kwargs.get("sliding_window"),
             )
         else:
             # The flash integration reads module.config._attn_implementation to pick the
             # kernel; it's currently our registered name, so restore the real inner kernel
             # name for the duration of the inner call (dispatch already resolved to us).
             cfg = getattr(module, "config", None)
-            saved = getattr(cfg, "_attn_implementation", None) if cfg is not None else None
+            saved = (
+                getattr(cfg, "_attn_implementation", None) if cfg is not None else None
+            )
             if cfg is not None:
                 cfg._attn_implementation = inner_name
             try:

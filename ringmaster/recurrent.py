@@ -102,16 +102,34 @@ def _rebind_globals(function, replacements):
     return clone
 
 
+def _global_cu_seqlens(x, world, local_cu=None):
+    import torch
+
+    from ringmaster.runtime import maybe_runtime
+
+    runtime = maybe_runtime()
+    if runtime is not None and runtime.varlen is not None:
+        cu = runtime.varlen[0]
+    else:
+        if local_cu is not None and local_cu.numel() > 2:
+            raise ValueError(
+                "Packed FLA CP requires global document boundaries in the runtime"
+            )
+        cu = torch.tensor([0, x.shape[1] * world], device=x.device)
+    if int(cu[-1]) != x.shape[1] * world:
+        raise ValueError("FLA CP document boundaries do not match the global sequence")
+    return cu.to(device=x.device, dtype=torch.long)
+
+
 def wire_gated_delta(mixers, cp_group):
     """Install native FLA state passing and convolution halos; return an undo callback."""
-    import torch
     import torch.distributed as dist
 
     build_context, chunk_gdn, causal_conv = require_fla_cp()
     world = dist.get_world_size(cp_group)
     originals = []
 
-    def context(x, *, conv_size=None):
+    def context(x, *, conv_size=None, cu_seqlens=None):
         if x.shape[0] != 1:
             raise ValueError(
                 "FLA context parallelism currently requires micro_batch_size: 1"
@@ -120,8 +138,11 @@ def wire_gated_delta(mixers, cp_group):
             raise ValueError(
                 "FLA CP shards must contain at least convolution width - 1 tokens"
             )
-        cu = torch.tensor([0, x.shape[1] * world], dtype=torch.long, device=x.device)
-        return build_context(cu, group=cp_group, conv1d_kernel_size=conv_size)
+        return build_context(
+            _global_cu_seqlens(x, world, cu_seqlens),
+            group=cp_group,
+            conv1d_kernel_size=conv_size,
+        )
 
     def delta(
         q,
@@ -138,11 +159,7 @@ def wire_gated_delta(mixers, cp_group):
             raise ValueError(
                 "Gated-delta CP requires use_cache=False and no initial_state"
             )
-        cu = kwargs.pop("cu_seqlens", None)
-        if cu is not None and (
-            cu.numel() != 2 or cu[0].item() != 0 or cu[-1].item() != q.shape[1]
-        ):
-            raise ValueError("GDN CP currently requires unpacked contiguous shards")
+        cu_seqlens = kwargs.pop("cu_seqlens", None)
         kwargs.pop("cu_seqlens_cpu", None)
         return chunk_gdn(
             q,
@@ -150,7 +167,7 @@ def wire_gated_delta(mixers, cp_group):
             v,
             g,
             beta,
-            cp_context=context(q),
+            cp_context=context(q, cu_seqlens=cu_seqlens),
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             **kwargs,
         )
@@ -162,7 +179,9 @@ def wire_gated_delta(mixers, cp_group):
             weight=weight,
             bias=bias,
             activation=activation,
-            cp_context=context(x, conv_size=weight.shape[-1]),
+            cp_context=context(
+                x, conv_size=weight.shape[-1], cu_seqlens=kwargs.get("cu_seqlens")
+            ),
         )
         return result.transpose(1, 2)
 
@@ -257,18 +276,15 @@ def wire_kda(mixers, cp_group):
     def context(x, cu_seqlens=None, conv_size=None):
         if x.shape[0] != 1:
             raise ValueError("KDA CP requires a batch size of one")
-        if cu_seqlens is not None and (
-            cu_seqlens.numel() != 2
-            or cu_seqlens[0].item() != 0
-            or cu_seqlens[-1].item() != x.shape[1]
-        ):
-            raise ValueError("KDA CP currently requires unpacked contiguous shards")
         if x.shape[1] == 0 or (conv_size is not None and x.shape[1] < conv_size - 1):
             raise ValueError(
                 "FLA CP shards must contain at least convolution width - 1 tokens"
             )
-        cu = torch.tensor([0, x.shape[1] * world], dtype=torch.long, device=x.device)
-        return build_context(cu, group=cp_group, conv1d_kernel_size=conv_size)
+        return build_context(
+            _global_cu_seqlens(x, world, cu_seqlens),
+            group=cp_group,
+            conv1d_kernel_size=conv_size,
+        )
 
     def delta(
         q,
@@ -283,6 +299,7 @@ def wire_kda(mixers, cp_group):
     ):
         if initial_state is not None or output_final_state:
             raise ValueError("KDA CP does not support cached states")
+        kwargs.pop("cu_seqlens_cpu", None)
         return chunk_kda(
             q,
             k,
@@ -333,7 +350,9 @@ def wire_kda(mixers, cp_group):
                 raise ValueError("KDA CP requires use_cache=False")
             mask = arguments.get("attention_mask")
             if mask is not None and (mask.ndim != 2 or not torch.all(mask == 1)):
-                raise ValueError("KDA CP currently requires dense, unpacked sequences")
+                raise ValueError(
+                    "KDA CP expects the context manager to consume the global attention mask"
+                )
             return forward(*args, **kwargs)
 
         return checked

@@ -6,12 +6,13 @@ Validates the hybrid Ulysses x Ring composition end-to-end on 4 ranks (which a
 
 import os
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 
-def _worker(rank, world, out_q):
+def _worker(rank, world, out_q, packed):
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29603")
     dist.init_process_group("gloo", rank=rank, world_size=world)
@@ -21,7 +22,7 @@ def _worker(rank, world, out_q):
         from ringmaster.ring.kernels import math_block
         from ringmaster.strategies.usp import make_usp_attention
 
-        rm.setup(
+        runtime = rm.setup(
             rm.RingmasterConfig(
                 size=world, backend=rm.Backend.USP, ulysses_size=2, ring_size=2
             ),
@@ -32,18 +33,41 @@ def _worker(rank, world, out_q):
         )
 
         torch.manual_seed(0)  # identical full tensors on every rank
-        b, h, total, d = 1, 4, 8, 16
+        b, h, total, d = 2, 4, 8, 16
         qf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
         kf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
         vf = torch.randn(b, h, total, d, dtype=torch.float64, requires_grad=True)
 
-        ref, _ = math_block(
-            qf.transpose(1, 2),
-            kf.transpose(1, 2),
-            vf.transpose(1, 2),
-            causal=True,
-            scaling=None,
-        )  # [b, total, h, d]
+        if packed:
+            from ringmaster.shard import varlen_meta
+
+            positions = torch.tensor(
+                [[0, 1, 2, 0, 1, 0, 1, 2], [0, 0, 1, 2, 3, 4, 5, 6]]
+            )
+            runtime.varlen = varlen_meta(positions, total)
+            rows = []
+            for row, lengths in enumerate(([3, 2, 3], [1, 7])):
+                parts, start = [], 0
+                for length in lengths:
+                    part, _ = math_block(
+                        qf[row : row + 1, :, start : start + length].transpose(1, 2),
+                        kf[row : row + 1, :, start : start + length].transpose(1, 2),
+                        vf[row : row + 1, :, start : start + length].transpose(1, 2),
+                        causal=True,
+                        scaling=None,
+                    )
+                    parts.append(part)
+                    start += length
+                rows.append(torch.cat(parts, dim=1))
+            ref = torch.cat(rows)
+        else:
+            ref, _ = math_block(
+                qf.transpose(1, 2),
+                kf.transpose(1, 2),
+                vf.transpose(1, 2),
+                causal=True,
+                scaling=None,
+            )
 
         local = total // world
         sl = slice(rank * local, (rank + 1) * local)
@@ -70,11 +94,15 @@ def _worker(rank, world, out_q):
         dist.destroy_process_group()
 
 
-def test_usp_2x2_matches_full_attention():
+@pytest.mark.parametrize("packed", [False, True])
+def test_usp_2x2_matches_full_attention(packed):
     world = 4
     ctx = mp.get_context("spawn")
     out_q = ctx.Queue()
-    procs = [ctx.Process(target=_worker, args=(r, world, out_q)) for r in range(world)]
+    procs = [
+        ctx.Process(target=_worker, args=(r, world, out_q, packed))
+        for r in range(world)
+    ]
     for p in procs:
         p.start()
     results = [out_q.get(timeout=90) for _ in range(world)]
