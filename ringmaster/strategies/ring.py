@@ -32,7 +32,9 @@ _PROVIDER = {
 }
 
 
-def make_ring_attention(provider: str, attn_implementation: str, rotate_method: RotateMethod):
+def make_ring_attention(
+    provider: str, attn_implementation: str, rotate_method: RotateMethod
+):
     from ringmaster.ring import ring_attention
     from ringmaster.runtime import get_runtime
 
@@ -58,10 +60,21 @@ def make_ring_attention(provider: str, attn_implementation: str, rotate_method: 
 
         multi = group is not None and dist.get_world_size(group) > 1
         if multi and attention_mask is not None:
-            raise ValueError("Ring attention requires an unpadded causal sequence; attention_mask is unsupported")
-        if multi and rt.config.load_balance in (LoadBalance.HEAD_TAIL, LoadBalance.DISTFLASH):
-            if dropout or window is not None or attn_implementation not in ("flash_attention_2", "math"):
-                raise ValueError("Balanced Ring requires FA2, zero dropout, and no sliding window")
+            raise ValueError(
+                "Ring attention requires an unpadded causal sequence; attention_mask is unsupported"
+            )
+        if multi and rt.config.load_balance in (
+            LoadBalance.HEAD_TAIL,
+            LoadBalance.DISTFLASH,
+        ):
+            if (
+                dropout
+                or window is not None
+                or attn_implementation not in ("flash_attention_2", "math")
+            ):
+                raise ValueError(
+                    "Balanced Ring requires FA2, zero dropout, and no sliding window"
+                )
         # Packed sequences: distflash keeps its balanced schedule with doc-masked
         # blocks; plain ring (and zigzag, for now) use the contiguous doc-masked path.
         if rt.varlen is not None and multi:
@@ -70,19 +83,42 @@ def make_ring_attention(provider: str, attn_implementation: str, rotate_method: 
                 from ringmaster.ring.distflash import distflash_attention
 
                 return distflash_attention(
-                    query, key, value, group=group, scaling=scaling, cu_seqlens=cu,
+                    query,
+                    key,
+                    value,
+                    group=group,
+                    scaling=scaling,
+                    cu_seqlens=cu,
                     attn_implementation=attn_implementation,
                 ), None
             if rt.config.load_balance == LoadBalance.HEAD_TAIL:
                 from ringmaster.ring.zigzag import zigzag_ring_attention
 
                 return zigzag_ring_attention(
-                    query, key, value, group=group, scaling=scaling, cu_seqlens=cu
+                    query,
+                    key,
+                    value,
+                    group=group,
+                    scaling=scaling,
+                    cu_seqlens=cu,
+                    causal=causal,
+                    dropout=dropout,
+                    window=window,
+                    attn_implementation=attn_implementation,
                 ), None
             from ringmaster.ring.loop import varlen_ring_attention
 
             return varlen_ring_attention(
-                query, key, value, group=group, scaling=scaling, cu_seqlens=cu
+                query,
+                key,
+                value,
+                group=group,
+                scaling=scaling,
+                cu_seqlens=cu,
+                causal=causal,
+                dropout=dropout,
+                window=window,
+                attn_implementation=attn_implementation,
             ), None
         balanced = causal and window is None and multi
         # Zigzag (head_tail): inputs are zigzag-sharded (rank holds chunks [r, 2W-1-r]);
@@ -90,13 +126,17 @@ def make_ring_attention(provider: str, attn_implementation: str, rotate_method: 
         if balanced and rt.config.load_balance == LoadBalance.HEAD_TAIL:
             from ringmaster.ring.zigzag import zigzag_ring_attention
 
-            return zigzag_ring_attention(query, key, value, group=group, scaling=scaling), None
+            return zigzag_ring_attention(
+                query, key, value, group=group, scaling=scaling
+            ), None
         # DistFlashAttn-style: contiguous (SSM-safe) + balanced by routing work to idle
         # ranks (rotates KV+Q+partial-O).
         if balanced and rt.config.load_balance == LoadBalance.DISTFLASH:
             from ringmaster.ring.distflash import distflash_attention
 
-            return distflash_attention(query, key, value, group=group, scaling=scaling), None
+            return distflash_attention(
+                query, key, value, group=group, scaling=scaling
+            ), None
         out = ring_attention(
             query,
             key,
@@ -132,7 +172,9 @@ def register_ring(
         )
     provider = _PROVIDER[resolved]
     # hf_kernels uses the flash kernel for blocks; torch_native uses aten flash.
-    attn_for_blocks = inner_attn if resolved == RingImpl.HF_KERNELS else "flash_attention_2"
+    attn_for_blocks = (
+        inner_attn if resolved == RingImpl.HF_KERNELS else "flash_attention_2"
+    )
     AttentionInterface.register(
         name, make_ring_attention(provider, attn_for_blocks, rotate_method)
     )

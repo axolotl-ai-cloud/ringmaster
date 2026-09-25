@@ -41,25 +41,25 @@ def cu_seqlens_from_position_ids(position_ids):
 
 
 def varlen_meta(global_position_ids, total_padded_len):
-    """(cu_seqlens, max_seqlen) over the full padded sequence, or None if not packed.
-
-    ``global_position_ids`` is the pre-shard packed positions; ``total_padded_len`` is
-    the post-pad sequence length the Ulysses all-to-all will reassemble. Any CP pad
-    tokens become a trailing segment so ``cu_seqlens[-1]`` matches the gathered length.
-    Batch size 1 only (the standard packed-sequence setup)."""
-    if global_position_ids is None or global_position_ids.shape[0] != 1:
+    """Global document boundaries, including per-row CP padding segments."""
+    if global_position_ids is None:
         return None
-    res = cu_seqlens_from_position_ids(global_position_ids)
-    if res is None:
+    rows, length = global_position_ids.shape
+    boundaries = []
+    packed = False
+    for row in range(rows):
+        starts = (global_position_ids[row] == 0).nonzero().flatten()
+        starts = torch.unique(torch.cat((starts.new_zeros(1), starts)))
+        packed |= starts.numel() > 1
+        boundaries.append(starts + row * total_padded_len)
+        if total_padded_len > length:
+            boundaries.append(starts.new_tensor([row * total_padded_len + length]))
+    if not packed:
         return None
-    cu, max_len = res
-    orig = int(cu[-1].item())
-    if total_padded_len > orig:
-        cu = torch.cat(
-            [cu, torch.tensor([total_padded_len], dtype=torch.int32, device=cu.device)]
-        )
-        max_len = max(max_len, total_padded_len - orig)
-    return cu, max_len
+    cu = torch.cat(
+        (*boundaries, boundaries[0].new_tensor([rows * total_padded_len]))
+    ).to(torch.int32)
+    return cu, int(cu.diff().max().item())
 
 
 def _ensure_global_shift_labels(batch):

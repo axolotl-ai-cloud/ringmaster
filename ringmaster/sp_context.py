@@ -81,17 +81,57 @@ class ContextParallelContextManager:
                 return remaining, kwargs
 
             broadcast_batch(kwargs, self.cp_group)
+            ids = kwargs["input_ids"]
             mask = kwargs.get("attention_mask")
             if mask is not None:
                 if (
                     mask.ndim != 2
-                    or not torch.all((mask == 0) | (mask == 1))
-                    or torch.any(mask[:, 1:] > mask[:, :-1])
+                    or torch.any(mask < 0)
+                    or (
+                        mask.is_floating_point()
+                        and torch.any(~torch.isfinite(mask) | (mask != mask.round()))
+                    )
+                    or torch.any((mask[:, 1:] > 0) & (mask[:, :-1] == 0))
                 ):
                     raise ValueError(
-                        "Context parallelism requires dense or right-padded causal sequences"
+                        "Context parallelism requires a right-padded causal 2D mask"
                     )
+                if torch.any(mask > 1) and kwargs.get("position_ids") is None:
+                    positions = torch.arange(
+                        mask.shape[1], device=mask.device
+                    ).expand_as(mask)
+                    starts = torch.ones_like(mask, dtype=torch.bool)
+                    starts[:, 1:] = mask[:, 1:] != mask[:, :-1]
+                    offsets = torch.where(starts, positions, 0).cummax(dim=1).values
+                    kwargs["position_ids"] = positions - offsets
                 kwargs.pop("attention_mask")
+            if kwargs.get("position_ids") is None:
+                cu = kwargs.get("cu_seqlens")
+                if cu is None:
+                    cu = kwargs.get("cu_seq_lens_q")
+                if cu is not None:
+                    cu = cu.to(device=ids.device, dtype=torch.long)
+                    if (
+                        cu.ndim != 1
+                        or cu.numel() < 2
+                        or int(cu[0]) != 0
+                        or int(cu[-1]) != ids.numel()
+                        or torch.any(cu[1:] <= cu[:-1])
+                    ):
+                        raise ValueError("Invalid global packed document boundaries")
+                    positions = torch.arange(ids.numel(), device=ids.device)
+                    documents = torch.bucketize(positions, cu[1:], right=True)
+                    kwargs["position_ids"] = (positions - cu[documents]).reshape_as(ids)
+            # Global collator metadata cannot describe a local shard.
+            for key in (
+                "cu_seq_lens_q",
+                "cu_seq_lens_k",
+                "max_length_q",
+                "max_length_k",
+                "cu_seqlens",
+                "max_seqlen",
+            ):
+                kwargs.pop(key, None)
             global_pos = kwargs.get("position_ids")  # full sequence, before sharding
             kwargs, info = shard_batch(
                 kwargs,

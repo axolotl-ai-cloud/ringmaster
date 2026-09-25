@@ -98,12 +98,24 @@ class _AllGatherKV(torch.autograd.Function):
         return grad_in, None
 
 
-def varlen_ring_attention(q, k, v, *, group, scaling, cu_seqlens):
-    """Packed-sequence ring attention on a contiguous shard. Gathers full K/V (the
-    ring's autograd-aware allgather) and runs ONE document-masked SDPA of this rank's
-    Q-slice against the whole sequence — correct for any ring-family backend, autograd
-    handles the backward. Zigzag/distflash load-balancing doesn't apply to packed
-    sequences (v1), so they route here too. q/k/v: [b, H, s_local, d] (b=1)."""
+def varlen_ring_attention(
+    q,
+    k,
+    v,
+    *,
+    group,
+    scaling,
+    cu_seqlens,
+    causal=True,
+    dropout=0.0,
+    window=None,
+    attn_implementation="math",
+):
+    """Gather K/V and attend independently within each packed document.
+
+    Flash uses separate query/key boundaries for each local document intersection;
+    the math fallback uses an explicit document mask. Inputs are [B, H, local_S, D].
+    """
     import math
 
     import torch.nn.functional as F
@@ -119,20 +131,63 @@ def varlen_ring_attention(q, k, v, *, group, scaling, cu_seqlens):
 
     L, S = qb.shape[1], k_full.shape[1]
     dev = qb.device
-    doc = _doc_ids(cu_seqlens, dev)[:S]
+    if q.is_cuda and attn_implementation.startswith("flash_attention"):
+        from ringmaster.strategies.ulysses import _flash_varlen_fn
+
+        qs, ks, vs, q_lengths, k_lengths = [], [], [], [], []
+        boundaries = cu_seqlens.tolist()
+        for row in range(q.shape[0]):
+            begin, end = row * S + rank * L, row * S + (rank + 1) * L
+            for start, stop in zip(boundaries[:-1], boundaries[1:]):
+                lo, hi = max(start, begin), min(stop, end)
+                if lo >= hi:
+                    continue
+                key_end = hi if causal else stop
+                qs.append(qb[row, lo - begin : hi - begin])
+                ks.append(k_full[row, start - row * S : key_end - row * S])
+                vs.append(v_full[row, start - row * S : key_end - row * S])
+                q_lengths.append(hi - lo)
+                k_lengths.append(key_end - start)
+        cu_q = torch.tensor([0, *q_lengths], dtype=torch.int32, device=dev).cumsum(
+            0, dtype=torch.int32
+        )
+        cu_k = torch.tensor([0, *k_lengths], dtype=torch.int32, device=dev).cumsum(
+            0, dtype=torch.int32
+        )
+        result = _flash_varlen_fn(attn_implementation)(
+            torch.cat(qs),
+            torch.cat(ks),
+            torch.cat(vs),
+            cu_q,
+            cu_k,
+            max(q_lengths),
+            max(k_lengths),
+            dropout_p=dropout,
+            softmax_scale=scaling,
+            causal=causal,
+            **({"window_size": window} if window else {}),
+        )
+        if isinstance(result, tuple):
+            result = result[0]
+        return result.reshape(q.shape[0], L, q.shape[1], q.shape[-1])
+
+    doc = _doc_ids(cu_seqlens, dev).reshape(q.shape[0], S)
     qidx = torch.arange(rank * L, rank * L + L, device=dev)
     kidx = torch.arange(S, device=dev)
     # attend within the same document, causally in global order
-    allow = (doc[qidx].unsqueeze(1) == doc.unsqueeze(0)) & (
-        kidx.unsqueeze(0) <= qidx.unsqueeze(1)
-    )
+    allow = doc[:, qidx, None] == doc[:, None, :]
+    if causal:
+        allow &= kidx[None, :] <= qidx[:, None]
+    if window is not None:
+        allow &= qidx[:, None] - kidx[None, :] <= window[0]
 
     scale = scaling if scaling is not None else 1.0 / math.sqrt(qb.shape[-1])
     out = F.scaled_dot_product_attention(
         qb.transpose(1, 2),
         k_full.transpose(1, 2),
         v_full.transpose(1, 2),
-        attn_mask=allow.unsqueeze(0).unsqueeze(0),
+        attn_mask=allow.unsqueeze(1),
+        dropout_p=dropout,
         scale=scale,
         enable_gqa=qb.shape[2] != kb.shape[2],
     )  # [b, Hq, L, d]

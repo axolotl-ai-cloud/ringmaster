@@ -26,7 +26,7 @@ def test_kda_detection_is_structural():
     assert recurrent.kda_mixers(torch.nn.Sequential(mixer)) == [mixer]
 
 
-def test_kda_wiring_guards_cache_packing_and_restores(monkeypatch):
+def test_kda_wiring_guards_cache_and_restores(monkeypatch):
     from types import SimpleNamespace
 
     mixer = KimiDeltaAttention()
@@ -49,10 +49,8 @@ def test_kda_wiring_guards_cache_packing_and_restores(monkeypatch):
     assert torch.equal(mixer(x)[0], x * 2)
     with pytest.raises(ValueError, match="use_cache=False"):
         mixer(x, None, object())
-    with pytest.raises(ValueError, match="dense, unpacked"):
+    with pytest.raises(ValueError, match="global attention mask"):
         mixer(x, attention_mask=torch.zeros(1, 8))
-    with pytest.raises(ValueError, match="unpacked contiguous"):
-        mixer(x, cu_seqlens=torch.tensor([0, 4, 8]))
     with pytest.raises(ValueError, match="batch size"):
         mixer(x.expand(2, -1, -1))
     restore()
@@ -66,8 +64,9 @@ def test_kda_wiring_guards_cache_packing_and_restores(monkeypatch):
     [
         torch.tensor([[0, 1, 1, 1]]),
         torch.tensor([[1, 0, 1, 0]]),
-        torch.tensor([[1, 1, 2, 2]]),
         torch.ones(1, 1, 4, 4),
+        torch.tensor([[1.0, 0.5, 1.0, 1.0]]),
+        torch.tensor([[1.0, float("nan"), 1.0, 1.0]]),
     ],
 )
 def test_cp_rejects_unsupported_global_masks(monkeypatch, mask):
@@ -111,3 +110,23 @@ def test_disabled_cp_wiring_needs_no_process_group():
         assert mixer.forward.__func__ is original
     finally:
         rm.teardown()
+
+
+def test_fla_global_boundaries_override_local_cu():
+    from types import SimpleNamespace
+
+    from ringmaster.runtime import maybe_runtime, set_runtime
+
+    previous = maybe_runtime()
+    x = torch.ones(1, 8, 4)
+    global_cu = torch.tensor([0, 5, 19, 20, 32], dtype=torch.int32)
+    try:
+        set_runtime(SimpleNamespace(varlen=(global_cu, 14)))
+        actual = recurrent._global_cu_seqlens(x, 4, torch.tensor([0, 5, 8]))
+        assert actual.tolist() == global_cu.tolist()
+        assert actual.dtype == torch.long
+        set_runtime(None)
+        with pytest.raises(ValueError, match="global document boundaries"):
+            recurrent._global_cu_seqlens(x, 4, torch.tensor([0, 5, 8]))
+    finally:
+        set_runtime(previous)

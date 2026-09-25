@@ -124,9 +124,6 @@ def wire_recurrent_layers(model, *, group=None):
     restores = []
 
     def guard(module, args, kwargs):
-        runtime = maybe_runtime()
-        if runtime is not None and runtime.varlen is not None:
-            raise ValueError("Packed recurrent context parallelism is not supported")
         arguments = signatures[id(module)].bind_partial(*args, **kwargs).arguments
         if any(
             arguments.get(key) is not None
