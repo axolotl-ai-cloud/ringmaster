@@ -87,7 +87,15 @@ def main():
                     15,
                 )
             set_runtime(runtime)
-            actual = _scan1(reference, group)(*local)
+            calls = []
+
+            def counted_reference(u, *args, **kwargs):
+                calls.append(u.shape)
+                return reference(u, *args, **kwargs)
+
+            actual = _scan1(counted_reference, group)(*local)
+            if not packed:
+                assert calls == [local[0].shape], calls
             torch.testing.assert_close(
                 actual, expected[:, :, start:end], atol=2e-5, rtol=2e-5
             )

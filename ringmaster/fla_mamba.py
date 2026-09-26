@@ -40,38 +40,51 @@ def _scan1(original, group):
             if documents is not None
             else None
         )
-        rows = []
-        for row in range(batch):
-            starts = (
-                [0, length]
-                if local_docs is None
-                else [0]
-                + (
-                    (local_docs[row, 1:] != local_docs[row, :-1]).nonzero().flatten()
-                    + 1
-                ).tolist()
-                + [length]
+        if local_docs is None:
+            output = original(
+                u.contiguous(),
+                dt.contiguous(),
+                A,
+                B.contiguous(),
+                C.contiguous(),
+                D,
+                z.contiguous(),
+                bias,
+                delta_softplus=True,
             )
-            rows.append(
-                torch.cat(
-                    [
-                        original(
-                            u[row : row + 1, :, start:end].contiguous(),
-                            dt[row : row + 1, :, start:end].contiguous(),
-                            A,
-                            B[row : row + 1, :, start:end].contiguous(),
-                            C[row : row + 1, :, start:end].contiguous(),
-                            D,
-                            z[row : row + 1, :, start:end].contiguous(),
-                            bias,
-                            delta_softplus=True,
-                        )
-                        for start, end in zip(starts[:-1], starts[1:])
-                    ],
-                    dim=-1,
+        else:
+            rows = []
+            for row in range(batch):
+                starts = (
+                    [0]
+                    + (
+                        (local_docs[row, 1:] != local_docs[row, :-1])
+                        .nonzero()
+                        .flatten()
+                        + 1
+                    ).tolist()
+                    + [length]
                 )
-            )
-        output = torch.cat(rows)
+                rows.append(
+                    torch.cat(
+                        [
+                            original(
+                                u[row : row + 1, :, start:end].contiguous(),
+                                dt[row : row + 1, :, start:end].contiguous(),
+                                A,
+                                B[row : row + 1, :, start:end].contiguous(),
+                                C[row : row + 1, :, start:end].contiguous(),
+                                D,
+                                z[row : row + 1, :, start:end].contiguous(),
+                                bias,
+                                delta_softplus=True,
+                            )
+                            for start, end in zip(starts[:-1], starts[1:])
+                        ],
+                        dim=-1,
+                    )
+                )
+            output = torch.cat(rows)
         final = u.new_zeros(batch, channels, A.shape[-1], dtype=torch.float32)
         for start in range(0, length, 128):
             end = min(start + 128, length)
