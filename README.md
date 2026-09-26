@@ -159,8 +159,17 @@ architecture allowlist is required.
 
 GDN and KDA require a single flattened batch row, contiguous shards, and caching
 disabled. Packed document boundaries are passed to native FLA CP contexts.
-Transformers Mamba2 adapters exchange convolution halos and scan states while
-resetting both at document boundaries. Use a contiguous layout for recurrent models.
+Transformers Mamba2 and FLA Mamba/Mamba2 adapters exchange convolution halos and
+recurrent states while resetting both at document boundaries. FLA mixers require
+loaded CUDA convolution and Mamba scan kernels (`mamba-ssm`/`causal-conv1d`, or
+Hub kernels bound by the caller). Set `FLA_CONV_BACKEND=cuda` before constructing
+standalone FLA models. Axolotl's FLA model wrapper binds its Hub kernels before
+construction. Use contiguous shards and `use_cache=False` while CP is active.
+
+Mamba1 recomputes differentiable carry states because the selective-scan kernel's
+returned final state does not provide the gradients needed across CP ranks.
+This adds work proportional to local sequence length and SSM state size; it is
+not a replacement for a native differentiable initial/final-state kernel.
 
 Attention accepts dense causal sequences or globally right-padded batches through
 the context manager. Left padding, holes, and arbitrary attention masks are

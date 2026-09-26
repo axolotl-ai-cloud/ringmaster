@@ -7,7 +7,9 @@ from .recurrent import _rebind_globals
 
 
 def mamba2_mixers(model):
-    mixers = []
+    from .fla_mamba import fla_mamba_mixers
+
+    mixers = fla_mamba_mixers(model)
     for module in model.modules():
         forward = getattr(module.forward, "__func__", None)
         raw = inspect.unwrap(forward) if forward is not None else None
@@ -236,8 +238,11 @@ def _norm_forward(mixer, fused):
 
 def wire_mamba2(mixers, group):
     originals = []
+    fla_restore = None
 
     def restore():
+        if fla_restore is not None:
+            fla_restore()
         for module, existed, forward in reversed(originals):
             if existed:
                 module.forward = forward
@@ -245,7 +250,13 @@ def wire_mamba2(mixers, group):
                 del module.forward
 
     try:
+        from .fla_mamba import fla_mamba_mixers, wire_fla_mamba
+
+        fla = [mixer for mixer in mixers if fla_mamba_mixers(mixer)]
+        fla_restore = wire_fla_mamba(fla, group) if fla else None
         for mixer in mixers:
+            if mixer in fla:
+                continue
             forward = mixer.forward.__func__
             raw = inspect.unwrap(forward)
             if getattr(mixer, "mamba_rms_norm", True) and (
