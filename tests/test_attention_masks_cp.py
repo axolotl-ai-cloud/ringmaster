@@ -48,6 +48,22 @@ def test_hub_flash_kernel_selects_flash_ring_provider(kernel):
     assert resolve_ring_impl(RingImpl.AUTO, kernel) == RingImpl.HF_KERNELS
 
 
+def test_balanced_ring_rejects_noncausal_attention(monkeypatch):
+    import ringmaster.runtime as runtime
+    from ringmaster.config import LoadBalance, RotateMethod
+    from ringmaster.strategies.ring import make_ring_attention
+
+    state = SimpleNamespace(
+        ring_group=object(), config=SimpleNamespace(load_balance=LoadBalance.HEAD_TAIL)
+    )
+    monkeypatch.setattr(runtime, "get_runtime", lambda: state)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    attention = make_ring_attention("math", "math", RotateMethod.ALLGATHER)
+    q = torch.zeros(1, 2, 4, 8)
+    with pytest.raises(ValueError, match="requires causal attention"):
+        attention(SimpleNamespace(), q, q, q, None, is_causal=False)
+
+
 def _model(family):
     if family == "sliding":
         from transformers import Qwen3Config, Qwen3ForCausalLM

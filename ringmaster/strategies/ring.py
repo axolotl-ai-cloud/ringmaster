@@ -79,12 +79,14 @@ def make_ring_attention(
             LoadBalance.DISTFLASH,
         ):
             if (
-                dropout
+                not causal
+                or dropout
                 or window is not None
                 or attn_implementation not in ("flash_attention_2", "math")
             ):
                 raise ValueError(
-                    "Balanced Ring requires FA2, zero dropout, and no sliding window"
+                    "Balanced Ring requires causal attention, FA2 or math blocks, zero dropout, "
+                    "and no sliding window"
                 )
         # Packed sequences: distflash keeps its balanced schedule with doc-masked
         # blocks; plain ring (and zigzag, for now) use the contiguous doc-masked path.
