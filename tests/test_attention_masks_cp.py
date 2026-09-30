@@ -29,14 +29,23 @@ def test_balanced_query_temperature_uses_global_positions(monkeypatch):
     torch.testing.assert_close(actual, scale(global_positions) / scale(local))
 
 
-def test_hub_flash_kernel_selects_flash_ring_provider():
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        "flash_attention_2",
+        "flash_attention_3",
+        "flash_attention_4",
+        "kernels-community/flash-attn2",
+        "kernels-community/vllm-flash-attn3",
+        "kernels-community/aiter-flash-attn",
+        "kernels-community/flash-attn4",
+    ],
+)
+def test_hub_flash_kernel_selects_flash_ring_provider(kernel):
     from ringmaster.config import RingImpl
     from ringmaster.strategies.ring import resolve_ring_impl
 
-    assert (
-        resolve_ring_impl(RingImpl.AUTO, "kernels-community/flash-attn2")
-        == RingImpl.HF_KERNELS
-    )
+    assert resolve_ring_impl(RingImpl.AUTO, kernel) == RingImpl.HF_KERNELS
 
 
 def _model(family):
