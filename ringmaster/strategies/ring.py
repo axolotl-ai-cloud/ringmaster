@@ -14,6 +14,8 @@ from __future__ import annotations
 import torch
 
 from ringmaster.config import RingImpl, RotateMethod
+from ringmaster.shard import attention_chunk_size, attention_segments
+from ringmaster.strategies.query_scaling import global_query_scale
 
 REGISTERED_NAME = "ringmaster_ring"
 
@@ -53,6 +55,7 @@ def make_ring_attention(
         rt = get_runtime()
         group = rt.ring_group
         causal = True if is_causal is None else is_causal
+        sliding_window = sliding_window or getattr(module, "sliding_window", None)
         window = (sliding_window - 1, 0) if sliding_window else None
         import torch.distributed as dist
 
@@ -63,6 +66,14 @@ def make_ring_attention(
             raise ValueError(
                 "Ring attention requires an unpadded causal sequence; attention_mask is unsupported"
             )
+        if (
+            multi
+            and attention_chunk_size(module) is not None
+            and rt.config.load_balance != LoadBalance.NONE
+        ):
+            raise ValueError("Chunked attention requires load_balance=none")
+        if multi:
+            query = global_query_scale(module, query)
         if multi and rt.config.load_balance in (
             LoadBalance.HEAD_TAIL,
             LoadBalance.DISTFLASH,
@@ -77,8 +88,16 @@ def make_ring_attention(
                 )
         # Packed sequences: distflash keeps its balanced schedule with doc-masked
         # blocks; plain ring (and zigzag, for now) use the contiguous doc-masked path.
-        if rt.varlen is not None and multi:
-            cu = rt.varlen[0]
+        segments = attention_segments(
+            module,
+            rt.varlen,
+            query.shape[0],
+            query.shape[2] * (dist.get_world_size(group) if multi else 1),
+            query.device,
+            sliding_window=sliding_window,
+        )
+        if segments is not None and multi:
+            cu = segments[0]
             if rt.config.load_balance == LoadBalance.DISTFLASH:
                 from ringmaster.ring.distflash import distflash_attention
 

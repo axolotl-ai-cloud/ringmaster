@@ -95,6 +95,8 @@ def make_usp_attention(provider: str, attn_implementation: str, rotate_method):
     from ringmaster.comm import seq_all_to_all
     from ringmaster.ring import ring_attention
     from ringmaster.runtime import get_runtime
+    from ringmaster.shard import attention_segments
+    from ringmaster.strategies.query_scaling import global_query_scale
 
     def usp_attention_forward(
         module,
@@ -111,14 +113,25 @@ def make_usp_attention(provider: str, attn_implementation: str, rotate_method):
         rt = get_runtime()
         ug, rg = rt.ulysses_group, rt.ring_group
         causal = True if is_causal is None else is_causal
+        sliding_window = sliding_window or getattr(module, "sliding_window", None)
         window = (sliding_window - 1, 0) if sliding_window else None
+
+        query = global_query_scale(module, query)
 
         q = seq_all_to_all(query, scatter_dim=1, gather_dim=2, group=ug)
         kv = torch.stack((key, value), dim=0)
         kv = seq_all_to_all(kv, scatter_dim=2, gather_dim=3, group=ug)
         k, v = kv[0], kv[1]
 
-        if rt.varlen is not None:
+        segments = attention_segments(
+            module,
+            rt.varlen,
+            q.shape[0],
+            q.shape[2] * rt.ring_size,
+            q.device,
+            sliding_window=sliding_window,
+        )
+        if segments is not None:
             from ringmaster.ring.loop import varlen_ring_attention
 
             out = varlen_ring_attention(
@@ -127,7 +140,7 @@ def make_usp_attention(provider: str, attn_implementation: str, rotate_method):
                 v,
                 group=rg,
                 scaling=scaling,
-                cu_seqlens=rt.varlen[0],
+                cu_seqlens=segments[0],
                 causal=causal,
                 dropout=dropout,
                 window=window,
