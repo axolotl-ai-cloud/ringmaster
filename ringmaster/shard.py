@@ -62,6 +62,47 @@ def varlen_meta(global_position_ids, total_padded_len):
     return cu, int(cu.diff().max().item())
 
 
+def attention_chunk_size(module):
+    config = getattr(module, "config", None)
+    layer_types = getattr(config, "layer_types", None)
+    layer_idx = getattr(module, "layer_idx", None)
+    if layer_types and layer_idx is None and "chunked_attention" in layer_types:
+        raise ValueError("Chunked attention requires a layer index")
+    if (
+        layer_types is None
+        or layer_idx is None
+        or layer_types[layer_idx] != "chunked_attention"
+    ):
+        return None
+    chunk_size = getattr(config, "attention_chunk_size", None)
+    if not isinstance(chunk_size, int) or chunk_size < 1:
+        raise ValueError("Chunked attention requires a positive attention_chunk_size")
+    return chunk_size
+
+
+def attention_segments(
+    module, packed, batch_size, seq_len, device, *, sliding_window=None
+):
+    """Global document/chunk boundaries for an attention layer."""
+    chunk_size = attention_chunk_size(module)
+    if chunk_size is None and packed is None and not sliding_window:
+        return None
+    if packed is None:
+        boundaries = list(range(0, (batch_size + 1) * seq_len, seq_len))
+    else:
+        boundaries = packed[0].tolist()
+    if chunk_size is not None:
+        boundaries = sorted(
+            set(boundaries).union(
+                position
+                for row in range(batch_size)
+                for position in range(row * seq_len, (row + 1) * seq_len, chunk_size)
+            )
+        )
+    cu = torch.tensor(boundaries, device=device, dtype=torch.int32)
+    return cu, int(cu.diff().max().item())
+
+
 def _ensure_global_shift_labels(batch):
     """Shift once on the full sequence before sharding: per-shard the boundary target
     (first token of the next rank's shard) is unreachable and would train vs -100."""

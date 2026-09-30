@@ -131,7 +131,9 @@ def varlen_ring_attention(
 
     L, S = qb.shape[1], k_full.shape[1]
     dev = qb.device
-    if q.is_cuda and attn_implementation.startswith("flash_attention"):
+    if q.is_cuda and (
+        attn_implementation.startswith("flash_attention") or "/" in attn_implementation
+    ):
         from ringmaster.strategies.ulysses import _flash_varlen_fn
 
         qs, ks, vs, q_lengths, k_lengths = [], [], [], [], []

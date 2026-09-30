@@ -15,6 +15,8 @@ import torch
 
 from ringmaster.comm import seq_all_to_all
 from ringmaster.runtime import get_runtime
+from ringmaster.shard import attention_segments
+from ringmaster.strategies.query_scaling import global_query_scale
 
 REGISTERED_NAME = "ringmaster_ulysses"
 
@@ -135,6 +137,8 @@ def make_ulysses_attention(inner_name: str):
                 "are v2."
             )
 
+        query = global_query_scale(module, query)
+
         # q/k/v: [b, n_heads, s_local, d]. Heads must divide the Ulysses degree;
         # the auto-selector guarantees this by choosing ulysses_size | num_kv_heads.
         for name, t in (("query", query), ("key", key), ("value", value)):
@@ -164,18 +168,27 @@ def make_ulysses_attention(inner_name: str):
             )
             k, v = kv[0], kv[1]
 
-        if rt.varlen is not None:
+        segments = attention_segments(
+            module,
+            rt.varlen,
+            q.shape[0],
+            q.shape[2],
+            q.device,
+            sliding_window=kwargs.get("sliding_window")
+            or getattr(module, "sliding_window", None),
+        )
+        if segments is not None:
             # packed sequences: flash varlen over the gathered full pack (global cu_seqlens)
             attn_out = _ulysses_varlen(
                 q,
                 k,
                 v,
-                rt.varlen,
+                segments,
                 dropout,
                 scaling,
                 is_causal,
                 inner_name,
-                kwargs.get("sliding_window"),
+                kwargs.get("sliding_window") or getattr(module, "sliding_window", None),
             )
         else:
             # The flash integration reads module.config._attn_implementation to pick the
