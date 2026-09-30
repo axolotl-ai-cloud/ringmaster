@@ -23,7 +23,7 @@ REGISTERED_NAME = "ringmaster_ring"
 def resolve_ring_impl(ring_impl: RingImpl, inner_attn: str) -> RingImpl:
     if ring_impl != RingImpl.AUTO:
         return ring_impl
-    if inner_attn.startswith("flash_attention"):
+    if inner_attn.startswith("flash_attention") or "/" in inner_attn:
         return RingImpl.HF_KERNELS
     return RingImpl.TORCH_NATIVE
 

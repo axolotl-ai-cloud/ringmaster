@@ -29,6 +29,16 @@ def test_balanced_query_temperature_uses_global_positions(monkeypatch):
     torch.testing.assert_close(actual, scale(global_positions) / scale(local))
 
 
+def test_hub_flash_kernel_selects_flash_ring_provider():
+    from ringmaster.config import RingImpl
+    from ringmaster.strategies.ring import resolve_ring_impl
+
+    assert (
+        resolve_ring_impl(RingImpl.AUTO, "kernels-community/flash-attn2")
+        == RingImpl.HF_KERNELS
+    )
+
+
 def _model(family):
     if family == "sliding":
         from transformers import Qwen3Config, Qwen3ForCausalLM
