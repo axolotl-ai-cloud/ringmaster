@@ -120,10 +120,6 @@ def make_ring_attention(
                     group=group,
                     scaling=scaling,
                     cu_seqlens=cu,
-                    causal=causal,
-                    dropout=dropout,
-                    window=window,
-                    attn_implementation=attn_implementation,
                 ), None
             from ringmaster.ring.loop import varlen_ring_attention
 
