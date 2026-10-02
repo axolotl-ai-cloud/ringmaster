@@ -60,6 +60,8 @@ def validate_recurrent(models, cp_size):
     if mixers:
         require_fla_cp()
         for mixer in mixers:
+            if getattr(mixer.forward, "_axolotl_gdn_kernel_interface", False):
+                continue
             if hasattr(mixer, "chunk_gated_delta_rule"):
                 continue
             forward = getattr(mixer.forward, "__func__", None)
@@ -123,6 +125,7 @@ def _global_cu_seqlens(x, world, local_cu=None):
 
 def wire_gated_delta(mixers, cp_group):
     """Install native FLA state passing and convolution halos; return an undo callback."""
+    import torch
     import torch.distributed as dist
 
     build_context, chunk_gdn, causal_conv = require_fla_cp()
@@ -144,6 +147,7 @@ def wire_gated_delta(mixers, cp_group):
             conv1d_kernel_size=conv_size,
         )
 
+    @torch.compiler.disable
     def delta(
         q,
         k,
@@ -172,6 +176,7 @@ def wire_gated_delta(mixers, cp_group):
             **kwargs,
         )
 
+    @torch.compiler.disable
     def conv(x, weight, bias=None, activation=None, **kwargs):
         x = x.transpose(1, 2).contiguous()
         result, _ = causal_conv(
@@ -185,12 +190,26 @@ def wire_gated_delta(mixers, cp_group):
         )
         return result.transpose(1, 2)
 
+    @torch.compiler.disable
+    def conv_bt(x, weight, bias=None, activation=None):
+        result, _ = causal_conv(
+            x.contiguous(),
+            weight=weight,
+            bias=bias,
+            activation=activation,
+            cp_context=context(x, conv_size=weight.shape[-1]),
+        )
+        return result
+
     def replace(obj, name, value):
         originals.append((obj, name, name in vars(obj), vars(obj).get(name)))
         setattr(obj, name, value)
 
     for mixer in mixers:
-        if hasattr(mixer, "chunk_gated_delta_rule"):
+        if getattr(mixer.forward, "_axolotl_gdn_kernel_interface", False):
+            replace(mixer, "_axolotl_gdn_cp_chunk", delta)
+            replace(mixer, "_axolotl_gdn_cp_conv", conv_bt)
+        elif hasattr(mixer, "chunk_gated_delta_rule"):
             replace(mixer, "chunk_gated_delta_rule", delta)
             replace(mixer, "causal_conv1d_fn", conv)
         else:

@@ -130,3 +130,45 @@ def test_fla_global_boundaries_override_local_cu():
             recurrent._global_cu_seqlens(x, 4, torch.tensor([0, 5, 8]))
     finally:
         set_runtime(previous)
+
+
+def test_axolotl_gdn_kernel_interface_uses_cp_and_restores(monkeypatch):
+    from types import SimpleNamespace
+
+    class AxolotlGatedDeltaNet(torch.nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states
+
+    AxolotlGatedDeltaNet.forward._axolotl_gdn_kernel_interface = True
+
+    calls = []
+
+    def build_context(cu, **kwargs):
+        return SimpleNamespace(cu=cu, conv_size=kwargs.get("conv1d_kernel_size"))
+
+    def chunk(q, k, v, g, beta, **kwargs):
+        calls.append(("chunk", kwargs["cp_context"].cu.tolist()))
+        return q + 1, None
+
+    def conv(x, weight, bias=None, activation=None, **kwargs):
+        calls.append(
+            ("conv", kwargs["cp_context"].cu.tolist(), kwargs["cp_context"].conv_size)
+        )
+        return x + 2, None
+
+    monkeypatch.setattr(recurrent, "require_fla_cp", lambda: (build_context, chunk, conv))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    mixer = AxolotlGatedDeltaNet()
+    assert recurrent.validate_recurrent([mixer], 2) == [mixer]
+
+    restore = recurrent.wire_gated_delta([mixer], object())
+    x = torch.ones(1, 4, 3)
+    weight = torch.ones(3, 2)
+    assert torch.equal(mixer._axolotl_gdn_cp_conv(x, weight), x + 2)
+    output, state = mixer._axolotl_gdn_cp_chunk(x, x, x, x, x)
+    assert torch.equal(output, x + 1)
+    assert state is None
+    assert calls == [("conv", [0, 8], 2), ("chunk", [0, 8])]
+    restore()
+    assert "_axolotl_gdn_cp_conv" not in vars(mixer)
+    assert "_axolotl_gdn_cp_chunk" not in vars(mixer)
