@@ -125,6 +125,7 @@ def _global_cu_seqlens(x, world, local_cu=None):
 
 def wire_gated_delta(mixers, cp_group):
     """Install native FLA state passing and convolution halos; return an undo callback."""
+    import torch
     import torch.distributed as dist
 
     build_context, chunk_gdn, causal_conv = require_fla_cp()
@@ -146,6 +147,7 @@ def wire_gated_delta(mixers, cp_group):
             conv1d_kernel_size=conv_size,
         )
 
+    @torch.compiler.disable
     def delta(
         q,
         k,
@@ -174,6 +176,7 @@ def wire_gated_delta(mixers, cp_group):
             **kwargs,
         )
 
+    @torch.compiler.disable
     def conv(x, weight, bias=None, activation=None, **kwargs):
         x = x.transpose(1, 2).contiguous()
         result, _ = causal_conv(
@@ -187,6 +190,7 @@ def wire_gated_delta(mixers, cp_group):
         )
         return result.transpose(1, 2)
 
+    @torch.compiler.disable
     def conv_bt(x, weight, bias=None, activation=None):
         result, _ = causal_conv(
             x.contiguous(),
