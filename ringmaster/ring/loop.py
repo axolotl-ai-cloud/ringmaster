@@ -88,7 +88,9 @@ class _AllGatherKV(torch.autograd.Function):
             g = grad.contiguous().clone()
             dist.all_reduce(g, op=dist.ReduceOp.SUM, group=group)
             return g[rank], None
-        grad_in = torch.empty_like(grad[0])
+        grad_in = torch.empty_like(
+            grad[0], memory_format=torch.contiguous_format
+        )
         dist.reduce_scatter(
             grad_in,
             [grad[i].contiguous() for i in range(world)],
