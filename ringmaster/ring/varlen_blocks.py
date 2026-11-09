@@ -13,23 +13,20 @@ lse ``[b, H, sq]``.
 
 from __future__ import annotations
 
-from functools import lru_cache
+import importlib
 
 import torch
+
+from ringmaster.hf_flash import flash_attn_funcs
 
 NEG_INF = float("-inf")
 
 
-@lru_cache(maxsize=2)
 def _flash_varlen_ops(attn_implementation: str = "flash_attention_2"):
     """Low-level Dao (fwd, bwd) varlen ops, or None (CPU/no-flash)."""
-    from transformers.modeling_flash_attention_utils import _lazy_imports
-
-    fn = _lazy_imports(attn_implementation)[0]
+    fn = flash_attn_funcs(attn_implementation)[0]
     if fn is None:
         return None
-    import importlib
-
     mod = importlib.import_module(fn.__module__)
     return mod._flash_attn_varlen_forward, mod._flash_attn_varlen_backward
 
