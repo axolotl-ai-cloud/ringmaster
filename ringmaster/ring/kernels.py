@@ -12,16 +12,14 @@ Each returns ``(out, lse)`` with out ``[b, s, h, d]`` and lse ``[b, h, s]``:
 from __future__ import annotations
 
 import math
-from functools import lru_cache
 
 import torch
 
+from ringmaster.hf_flash import flash_attn_funcs
 
-@lru_cache(maxsize=4)
+
 def _flash_fn(attn_implementation: str):
-    from transformers.modeling_flash_attention_utils import _lazy_imports
-
-    flash_attn_func, *_ = _lazy_imports(attn_implementation)
+    flash_attn_func = flash_attn_funcs(attn_implementation)[0]
     if flash_attn_func is None:
         raise RuntimeError(f"no flash kernel for '{attn_implementation}' from HF kernels")
     return flash_attn_func

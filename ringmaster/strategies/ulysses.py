@@ -9,11 +9,10 @@ Ulysses is inherently balanced (zigzag is a Ring-only concern).
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 
 from ringmaster.comm import seq_all_to_all
+from ringmaster.hf_flash import flash_attn_funcs
 from ringmaster.runtime import get_runtime
 from ringmaster.shard import attention_segments
 from ringmaster.strategies.query_scaling import global_query_scale
@@ -34,11 +33,8 @@ def _resolve_inner(inner_name: str):
     return fn
 
 
-@lru_cache(maxsize=2)
 def _flash_varlen_fn(inner_name: str):
-    from transformers.modeling_flash_attention_utils import _lazy_imports
-
-    fn = _lazy_imports(inner_name)[1]
+    fn = flash_attn_funcs(inner_name)[1]
     if fn is None:
         raise RuntimeError(
             f"varlen CP needs a flash kernel; '{inner_name}' has no flash_attn_varlen_func"

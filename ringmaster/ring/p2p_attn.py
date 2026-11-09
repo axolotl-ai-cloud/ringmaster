@@ -18,6 +18,7 @@ from functools import lru_cache
 import torch
 import torch.distributed as dist
 
+from ringmaster.hf_flash import loaded_flash_attn_funcs
 from ringmaster.ring.merge import update_out_and_lse
 
 LOG = logging.getLogger(__name__)
@@ -41,11 +42,10 @@ def _resolve_flash_ops(attn_implementation, loaded_implementation):
     # Reuse the kernel transformers already loaded for the model. Re-resolving a hub-kernel
     # fallback (e.g. kernels-community/flash-attn2) goes back to the Hub, so a transient error
     # or offline mode there would cache None and disable flash for the whole process.
-    fallback = getattr(fau, "FLASH_ATTN_KERNEL_FALLBACK", {}).get(attn_implementation)
-    if loaded_implementation in (attn_implementation, fallback):
-        ops = _dao_ops(getattr(fau, "_flash_fn", None))
-        if ops is not None:
-            return ops
+    loaded = loaded_flash_attn_funcs(attn_implementation)
+    ops = _dao_ops(loaded[0]) if loaded is not None else None
+    if ops is not None:
+        return ops
     try:
         return _dao_ops(fau._lazy_imports(attn_implementation)[0])
     except Exception as exc:
